@@ -994,10 +994,17 @@ fn actionbar_ui(
     }
 
     if like_resp.clicked() {
-        action = Some(NoteAction::React(ReactAction::new(
-            NoteId::new(*note.id()),
-            "🤙🏻",
-        )));
+        if filled {
+            action = Some(NoteAction::React(ReactAction::new(
+                NoteId::new(*note.id()),
+                "__DELETE__",
+            )));
+        } else {
+            action = Some(NoteAction::React(ReactAction::new(
+                NoteId::new(*note.id()),
+                "🤙🏻",
+            )));
+        }
     }
 
     if quote_resp.clicked() {
