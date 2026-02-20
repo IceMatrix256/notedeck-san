@@ -24,12 +24,30 @@ jobs:
       - name: Install required packages
         run: sudo apt-get update && sudo apt-get install -y unzip libncurses5
 
-      - name: Install Android SDK cmdline-tools
-        uses: r0adkll/setup-android@v2
-        with:
-          api-level: 33
-          build-tools: 33.0.2
-          ndk: 25.2.9519653
+      - name: Install Android SDK cmdline-tools and packages
+        run: |
+          SDK_ROOT="${{ github.workspace }}/android-sdk"
+          mkdir -p "$SDK_ROOT/cmdline-tools"
+          cd "$SDK_ROOT"
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip
+          mkdir -p cmdline-tools/latest
+          mv cmdline-tools/* cmdline-tools/latest/ || true
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-33" "build-tools;33.0.2" "ndk;25.2.9519653"
+
+      - name: Set ANDROID_NDK_HOME and create local.properties
+        run: |
+          SDK_ROOT="${{ github.workspace }}/android-sdk"
+          NDK_DIR=$(ls -d "$SDK_ROOT/ndk"/* | sort -V | tail -n 1)
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          echo "sdk.dir=$SDK_ROOT" > crates/notedeck_chrome/android/local.properties
+
+      - name: Debug: list installed SDK components
+        run: |
+          echo "SDK root: ${{ github.workspace }}/android-sdk"
+          ${{ github.workspace }}/android-sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root=${{ github.workspace }}/android-sdk --list || true
 
       - name: Install Rust and cargo-ndk
         uses: actions-rs/toolchain@v1
