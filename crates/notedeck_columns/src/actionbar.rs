@@ -109,7 +109,7 @@ fn execute_note_action(
                             tracing::error!("Failed to send delete (undo) reaction: {err}");
                         } else {
                             ui.ctx().data_mut(|d| {
-                                d.remove_temp(event_key);
+                                d.remove_temp::<String>(event_key);
                                 d.insert_temp(reaction_sent_id(filled.pubkey, react_action.note_id.bytes()), false);
                             });
                         }
@@ -402,8 +402,8 @@ fn send_reaction_event(
     pool.send(&event);
 
     // Try to get event id hex; assume built_note has id accessor
-    // This may be `built_note.id.hex()` or similar; adjust if types differ.
-    let note_hex = built_note.id.hex();
+    // This may be `built_note.id().hex()` or similar; adjust if types differ.
+    let note_hex = built_note.id().hex();
 
     Ok(note_hex)
 }
