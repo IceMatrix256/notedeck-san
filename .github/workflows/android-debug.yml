@@ -1,0 +1,67 @@
+name: Android Debug APK (feature/reactions)
+
+on:
+  push:
+    branches:
+      - feature/reactions
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install required packages
+        run: sudo apt-get update && sudo apt-get install -y unzip libncurses5
+
+      - name: Install Android SDK cmdline-tools
+        run: |
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          cd "$ANDROID_SDK_ROOT"
+          curl -o sdk-tools.zip https://dl.google.com/android/repository/commandlinetools-linux-10125400_latest.zip
+          unzip sdk-tools.zip -d cmdline-tools
+          mv cmdline-tools/cmdline-tools cmdline-tools/latest || true
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses
+
+      - name: Install SDK packages
+        run: |
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          sdkmanager "platform-tools" "platforms;android-33" "build-tools;33.0.2" "ndk;25.2.9519653"
+
+      - name: Add sdk tools to PATH
+        run: echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+
+      - name: Install Rust and cargo-ndk
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Build Rust native libs (arm64)
+        working-directory: ${{ github.workspace }}
+        run: |
+          cargo ndk --target arm64-v8a -o ./crates/notedeck_chrome/android/app/src/main/jniLibs/ build --profile release
+
+      - name: Build Android app (assembleDebug)
+        working-directory: crates/notedeck_chrome/android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: crates/notedeck_chrome/android/app/build/outputs/apk/debug/app-debug.apk
