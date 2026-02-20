@@ -65,6 +65,28 @@ jobs:
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
 
+      - name: Cleanup old debug releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          repo="${{ github.repository }}"
+          token="${{ secrets.GITHUB_TOKEN }}"
+          releases_json=$(curl -s -H "Authorization: token $token" "https://api.github.com/repos/$repo/releases")
+          ids_to_delete=$(echo "$releases_json" | jq -r '[.[] | select(.tag_name | startswith("debug-apk-"))] | sort_by(.published_at) | reverse | .[3:] | .[].id' || true)
+          if [ -z "$ids_to_delete" ]; then
+            echo "No releases to delete"
+          else
+            for id in $ids_to_delete; do
+              echo "Deleting release $id and its assets"
+              assets=$(curl -s -H "Authorization: token $token" "https://api.github.com/repos/$repo/releases/$id/assets" | jq -r '.[].id' || true)
+              for aid in $assets; do
+                curl -s -X DELETE -H "Authorization: token $token" "https://api.github.com/repos/$repo/releases/assets/$aid" || true
+              done
+              curl -s -X DELETE -H "Authorization: token $token" "https://api.github.com/repos/$repo/releases/$id" || true
+            done
+          fi
+
       - name: Create GitHub release
         id: create_release
         uses: actions/create-release@v1

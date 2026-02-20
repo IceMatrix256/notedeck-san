@@ -22,7 +22,7 @@ jobs:
           java-version: '17'
 
       - name: Install required packages
-        run: sudo apt-get update && sudo apt-get install -y unzip libncurses5
+        run: sudo apt-get update && sudo apt-get install -y unzip libncurses5 jq
 
       - name: Install Android SDK cmdline-tools and packages
         run: |
@@ -73,6 +73,24 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
+
+      - name: Cleanup old debug artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          repo="${{ github.repository }}"
+          token="${{ secrets.GITHUB_TOKEN }}"
+          artifacts_json=$(curl -s -H "Authorization: token $token" "https://api.github.com/repos/$repo/actions/artifacts")
+          ids_to_delete=$(echo "$artifacts_json" | jq -r '[.artifacts[] | select(.name=="debug-apk")] | sort_by(.created_at) | reverse | .[3:] | .[].id' || true)
+          if [ -z "$ids_to_delete" ]; then
+            echo "No artifacts to delete"
+          else
+            for id in $ids_to_delete; do
+              echo "Deleting artifact $id"
+              curl -s -X DELETE -H "Authorization: token $token" "https://api.github.com/repos/$repo/actions/artifacts/$id" || true
+            done
+          fi
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
