@@ -57,10 +57,16 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
-      - name: Build Rust native libs (arm64) (optional)
+      - name: Build Rust native libs (arm64 + armeabi) (required)
         working-directory: ${{ github.workspace }}
         run: |
-          cargo ndk --target arm64-v8a -o ./crates/notedeck_chrome/android/app/src/main/jniLibs/ build --profile release || echo 'cargo ndk failed; continuing without native libs'
+          set -eux
+          mkdir -p crates/notedeck_chrome/android/app/src/main/jniLibs
+          cargo ndk -t arm64-v8a -o ./crates/notedeck_chrome/android/app/src/main/jniLibs build --release
+          cargo ndk -t armeabi-v7a -o ./crates/notedeck_chrome/android/app/src/main/jniLibs build --release
+          ls -la ./crates/notedeck_chrome/android/app/src/main/jniLibs || true
+          test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/arm64-v8a/libnotedeck_chrome.so
+          test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/armeabi-v7a/libnotedeck_chrome.so
 
       - name: Build Android app (assembleDebug)
         working-directory: crates/notedeck_chrome/android
