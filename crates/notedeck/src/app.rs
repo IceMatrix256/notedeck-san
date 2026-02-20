@@ -212,10 +212,10 @@ impl Notedeck {
 
         let map_size = if cfg!(target_os = "windows") {
             // 16 Gib on windows because it actually creates the file
-            1024usize * 1024usize * 1024usize * 16usize
+            1024usize.saturating_mul(1024).saturating_mul(1024).saturating_mul(16)
         } else {
             // 1 TiB for everything else since its just virtually mapped
-            1024usize * 1024usize * 1024usize * 1024usize
+            1024usize.saturating_mul(1024).saturating_mul(1024).saturating_mul(1024)
         };
 
         let settings = SettingsHandler::new(&path).load();
