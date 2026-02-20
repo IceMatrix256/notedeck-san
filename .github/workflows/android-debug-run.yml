@@ -45,20 +45,26 @@ jobs:
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
 
-      - name: Create GitHub release and upload APK
-        if: ${{ success() }}
-        run: |
-          set -eux
-          APK=crates/notedeck_chrome/android/app/build/outputs/apk/debug/app-debug.apk
-          if [ ! -f "$APK" ]; then echo "APK not found"; exit 1; fi
-          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
-          TAG="debug-apk-${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
-          DATA=$(printf '{"tag_name":"%s","name":"%s","draft":false,"prerelease":false}' "$TAG" "$TAG")
-          RESP=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" -d "$DATA" "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases")
-          UPLOAD_URL=$(echo "$RESP" | python3 -c "import sys, json; obj=json.load(sys.stdin); print(obj.get('upload_url','').split('{')[0])")
-          if [ -z "$UPLOAD_URL" ]; then echo "Failed to create release: $RESP"; exit 1; fi
-          curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/vnd.android.package-archive" --data-binary @"$APK" "$UPLOAD_URL?name=app-debug-${GITHUB_RUN_NUMBER}.apk" -o /tmp/upload_resp || true
-          echo "Release upload response:" && cat /tmp/upload_resp || true
+      - name: Create GitHub release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: debug-apk-${{ github.run_number }}-${{ github.sha }}
+          release_name: debug-apk-${{ github.run_number }}-${{ github.sha }}
+          draft: false
+          prerelease: false
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: crates/notedeck_chrome/android/app/build/outputs/apk/debug/app-debug.apk
+          asset_name: app-debug-${{ github.run_number }}.apk
+          asset_content_type: application/vnd.android.package-archive
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
