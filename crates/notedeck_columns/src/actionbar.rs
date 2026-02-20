@@ -401,9 +401,8 @@ fn send_reaction_event(
     // Send to relays
     pool.send(&event);
 
-    // Try to get event id hex; assume built_note has id accessor
-    // This may be `built_note.id().hex()` or similar; adjust if types differ.
-    let note_hex = built_note.id().hex();
+    // Try to get event id hex; built_note.id() returns bytes so wrap in NoteId to use .hex()
+    let note_hex = NoteId::new(*built_note.id()).hex();
 
     Ok(note_hex)
 }
