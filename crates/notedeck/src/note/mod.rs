@@ -226,6 +226,12 @@ pub fn reaction_sent_id(sender_pk: &enostr::Pubkey, note_reacted_to: &[u8; 32]) 
     egui::Id::new(("sent-reaction-id", note_reacted_to, sender_pk))
 }
 
+/// Temporary storage key for the reaction event id (so we can undo).
+/// Key is ("sent-reaction-event", note_id, sender_pubkey)
+pub fn reaction_sent_event_id(sender_pk: &enostr::Pubkey, note_reacted_to: &[u8; 32]) -> egui::Id {
+    egui::Id::new(("sent-reaction-event", note_reacted_to, sender_pk))
+}
+
 /// Count the number of hashtags in a note by examining its tags
 pub fn count_hashtags(note: &Note) -> usize {
     let mut count = 0;
