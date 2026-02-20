@@ -100,15 +100,37 @@ fn execute_note_action(
         }
         NoteAction::React(react_action) => {
             if let Some(filled) = accounts.selected_filled() {
-                if let Err(err) = send_reaction_event(ndb, txn, pool, filled, &react_action) {
-                    tracing::error!("Failed to send reaction: {err}");
+                // support delete marker value "__DELETE__" to undo
+                if react_action.content == "__DELETE__" {
+                    // find stored reaction event id (if any) and send delete
+                    let event_key = egui::Id::new(("sent-reaction-event", react_action.note_id.bytes(), filled.pubkey));
+                    if let Some(evt_hex) = ui.ctx().data(|d| d.get_temp::<String>(event_key)) {
+                        if let Err(err) = send_delete_event_by_id(ndb, pool, filled, &evt_hex) {
+                            tracing::error!("Failed to send delete (undo) reaction: {err}");
+                        } else {
+                            ui.ctx().data_mut(|d| {
+                                d.remove_temp(event_key);
+                                d.insert_temp(reaction_sent_id(filled.pubkey, react_action.note_id.bytes()), false);
+                            });
+                        }
+                    } else {
+                        tracing::warn!("No stored reaction event id to delete for this note");
+                    }
+                } else {
+                    // send reaction, store event id for possible undo
+                    match send_reaction_event(ndb, txn, pool, filled, &react_action) {
+                        Ok(evt_hex) => {
+                            ui.ctx().data_mut(|d| {
+                                d.insert_temp(reaction_sent_id(filled.pubkey, react_action.note_id.bytes()), true);
+                                let event_key = egui::Id::new(("sent-reaction-event", react_action.note_id.bytes(), filled.pubkey));
+                                d.insert_temp(event_key, evt_hex);
+                            });
+                        }
+                        Err(err) => {
+                            tracing::error!("Failed to send reaction: {err}");
+                        }
+                    }
                 }
-                ui.ctx().data_mut(|d| {
-                    d.insert_temp(
-                        reaction_sent_id(filled.pubkey, react_action.note_id.bytes()),
-                        true,
-                    )
-                });
             } else {
                 router_action = Some(RouterAction::route_to(Route::accounts()));
             }
@@ -315,7 +337,8 @@ fn send_reaction_event(
     pool: &mut RelayPool,
     kp: FilledKeypair<'_>,
     reaction: &ReactAction,
-) -> Result<(), String> {
+) -> Result<String, String> {
+    // Build reaction event (kind 7) and return its hex id on success.
     let Ok(note) = ndb.get_note_by_id(txn, reaction.note_id.bytes()) else {
         return Err(format!("noteid {:?} not found in ndb", reaction.note_id));
     };
@@ -343,7 +366,7 @@ fn send_reaction_event(
         builder = builder.tag_str(relay);
     }
 
-    // we don't support addressable events yet... but why not future proof it?
+    // addressable event support (future-proof)
     if let Some(d_value) = d_tag_value.as_deref() {
         let coordinates = format!("{}:{}:{}", target_kind, target_pubkey.hex(), d_value);
 
@@ -359,22 +382,64 @@ fn send_reaction_event(
         .tag_str("k")
         .tag_str(&target_kind.to_string());
 
-    let note = builder
+    let built_note = builder
         .sign(&kp.secret_key.secret_bytes())
         .build()
         .ok_or_else(|| "failed to build reaction event".to_owned())?;
 
-    let Ok(event) = &enostr::ClientMessage::event(&note) else {
-        return Err("failed to convert reaction note into client message".to_owned());
-    };
+    // Try to convert to client message & serialize
+    let event = enostr::ClientMessage::event(&built_note)
+        .map_err(|_| "failed to convert reaction note into client message".to_owned())?;
 
-    let Ok(json) = event.to_json() else {
-        return Err("failed to serialize reaction event to json".to_owned());
-    };
+    let json = event
+        .to_json()
+        .map_err(|_| "failed to serialize reaction event to json".to_owned())?;
 
+    // local ingest so UI updates immediately
     let _ = ndb.process_event_with(&json, IngestMetadata::new().client(true));
 
-    pool.send(event);
+    // Send to relays
+    pool.send(&event);
+
+    // Try to get event id hex; assume built_note has id accessor
+    // This may be `built_note.id.hex()` or similar; adjust if types differ.
+    let note_hex = built_note.id.hex();
+
+    Ok(note_hex)
+}
+
+fn send_delete_event_by_id(
+    ndb: &mut Ndb,
+    pool: &mut RelayPool,
+    kp: FilledKeypair<'_>,
+    reaction_event_hex: &str,
+) -> Result<(), String> {
+    // Build a deletion event (kind = 5) that references the reaction event id via an "e" tag.
+    // Convert hex to bytes
+    let bytes = hex::decode(reaction_event_hex)
+        .map_err(|_| "invalid reaction event hex".to_owned())?;
+    let id_arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| "reaction id not 32 bytes".to_owned())?;
+
+    let mut builder = NoteBuilder::new().kind(5).content("delete reaction");
+
+    builder = builder.start_tag().tag_str("e").tag_id(&id_arr);
+
+    let built_note = builder
+        .sign(&kp.secret_key.secret_bytes())
+        .build()
+        .ok_or_else(|| "failed to build delete event".to_owned())?;
+
+    let event = enostr::ClientMessage::event(&built_note)
+        .map_err(|_| "failed to convert delete note into client message".to_owned())?;
+
+    let json = event
+        .to_json()
+        .map_err(|_| "failed to serialize delete event to json".to_owned())?;
+
+    let _ = ndb.process_event_with(&json, IngestMetadata::new().client(true));
+    pool.send(&event);
 
     Ok(())
 }
