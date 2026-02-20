@@ -48,6 +48,11 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
 
+      - name: Add Rust Android targets
+        run: |
+          set -eux
+          rustup target add aarch64-linux-android armv7-linux-androideabi || true
+
       - name: Build Rust native libs (arm64 + armeabi) (required)
         working-directory: ${{ github.workspace }}
         run: |
