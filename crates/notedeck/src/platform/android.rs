@@ -55,7 +55,8 @@ pub fn android_log_d(tag: &str, msg: &str) {
 
     // Try to attach to the JVM and call android.util.Log.d(TAG, MSG)
     let vm = get_jvm();
-    match vm.attach_current_thread() {
+    let attach_res = vm.attach_current_thread();
+    match attach_res {
         Ok(mut env) => {
             use jni::objects::JValue;
             match (env.new_string(tag), env.new_string(msg), env.find_class("android/util/Log")) {
