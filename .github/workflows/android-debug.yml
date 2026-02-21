@@ -45,7 +45,7 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
           echo "sdk.dir=$SDK_ROOT" > crates/notedeck_chrome/android/local.properties
 
-      - name: Debug: list installed SDK components
+      - name: "Debug: list installed SDK components"
         run: |
           echo "SDK root: ${{ github.workspace }}/android-sdk"
           ${{ github.workspace }}/android-sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root=${{ github.workspace }}/android-sdk --list || true
