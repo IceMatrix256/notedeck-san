@@ -170,7 +170,42 @@ jobs:
           emulator-options: -no-window -no-audio -no-boot-anim
           # provide a script to run while emulator is available; downstream steps will also run even on failure
           script: |
-            echo "Emulator started; continuing with downstream steps"
+            set -eux
+            echo "Emulator started; running install+capture script"
+            # wait for emulator device
+            timeout 120s adb wait-for-device || true
+            # install APK from artifact dir if present
+            apk=$(find artifact -type f -name "app-debug.apk" | head -n 1 || true)
+            if [ -n "$apk" ]; then
+              echo "Installing APK: $apk"
+              adb install -r "$apk" || true
+            else
+              echo "APK not found in artifact dir"
+            fi
+            # start app and collect logs while emulator process is alive
+            adb shell am start -n com.damus.notedeck/.MainActivity || true
+            adb logcat -c || true
+            sleep 3
+            adb shell input tap 200 400 || true
+            adb shell input swipe 200 400 200 400 1500 || true
+            sleep 2
+            adb logcat -v time -d | grep -E "native-echo|notedeck_java|notedeck_native|MainActivity" > native_logcat.txt || true
+            ls -la native_logcat.txt || true
+            echo "native_logcat lines:" && wc -l native_logcat.txt || true
+            head -n 200 native_logcat.txt || true
+            # pull persistent fallback logs with retries
+            mkdir -p pulled
+            adb shell ls -la /sdcard/Android/data/com.damus.notedeck/files || true
+            for f in notedeck_native.log notedeck_java.log; do
+              for i in 1 2 3 4 5; do
+                timeout 10s adb pull /sdcard/Android/data/com.damus.notedeck/files/$f pulled/ && break || {
+                  echo "pull failed for $f attempt $i"
+                  sleep 2
+                }
+              done
+            done
+            ls -la pulled || true
+
       - name: Find APK
         run: |
           set -eux
