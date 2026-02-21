@@ -21,7 +21,7 @@ jobs:
           java-version: '17'
 
       - name: Install prerequisites
-        run: sudo apt-get update && sudo apt-get install -y wget unzip
+        run: sudo apt-get update && sudo apt-get install -y wget unzip jq
 
       - name: Install SDK cmdline tools
         run: |
@@ -92,26 +92,24 @@ jobs:
             done
           fi
 
-      - name: Create GitHub release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Create release and upload APK (curl)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: debug-apk-${{ github.run_number }}-${{ github.sha }}
-          release_name: debug-apk-${{ github.run_number }}-${{ github.sha }}
-          draft: false
-          prerelease: false
-
-      - name: Upload release asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: crates/notedeck_chrome/android/app/build/outputs/apk/debug/app-debug.apk
-          asset_name: app-debug-${{ github.run_number }}.apk
-          asset_content_type: application/vnd.android.package-archive
+        run: |
+          set -eux
+          repo="${{ github.repository }}"
+          tag="debug-apk-${{ github.run_number }}-${{ github.sha }}"
+          release_name="debug-apk-${{ github.run_number }}-${{ github.sha }}"
+          # create release via API
+          create_resp=$(curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/json" -d "{\"tag_name\":\"$tag\",\"name\":\"$release_name\",\"draft\":false,\"prerelease\":false}" "https://api.github.com/repos/$repo/releases")
+          # extract upload_url (requires jq)
+          upload_url=$(echo "$create_resp" | jq -r .upload_url)
+          apk_path=crates/notedeck_chrome/android/app/build/outputs/apk/debug/app-debug.apk
+          apk_name="app-debug-${{ github.run_number }}.apk"
+          # strip the template part from upload_url
+          upload_url="${upload_url%\{*}"
+          # upload asset
+          curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" -H "Content-Type: application/vnd.android.package-archive" --data-binary @"$apk_path" "$upload_url?name=$apk_name" || true
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
