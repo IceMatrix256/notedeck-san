@@ -993,17 +993,86 @@ fn actionbar_ui(
         action = Some(NoteAction::Reply(NoteId::new(*note.id())));
     }
 
-    if like_resp.clicked() {
-        if filled {
-            action = Some(NoteAction::React(ReactAction::new(
-                NoteId::new(*note.id()),
-                "__DELETE__",
-            )));
+    {
+        // Reaction choices and default index stored in ctx.data
+        let reactions: &[&'static str] = &["🤙🏻", "❤️", "👍", "😂", "😮", "😢", "🔥", "🎉"];
+        let ctx = ui.ctx();
+        let default_idx_key = egui::Id::new("default_reaction_index");
+        let default_idx = ctx
+            .data(|d| d.get_temp::<i32>(default_idx_key))
+            .unwrap_or(0)
+            .clamp(0, (reactions.len() - 1) as i32) as usize;
+
+        let press_start_key = egui::Id::new(("like_press_start", note_key));
+        let picker_open_key = egui::Id::new(("reaction_picker_open", note_key));
+        let picker_pos_key = egui::Id::new(("reaction_picker_pos", note_key));
+        let long_press_threshold = 0.6_f64;
+
+        // Track press start time when pointer is down
+        if like_resp.is_pointer_button_down_on() {
+            if ctx.data(|d| d.get_temp::<f64>(press_start_key)).is_none() {
+                ctx.data_mut(|d| d.insert_temp(press_start_key, ctx.input().time));
+            }
         } else {
-            action = Some(NoteAction::React(ReactAction::new(
-                NoteId::new(*note.id()),
-                "🤙🏻",
-            )));
+            if let Some(start_time) = ctx.data(|d| d.get_temp::<f64>(press_start_key)) {
+                ctx.data_mut(|d| d.remove_temp::<f64>(press_start_key));
+                let duration = ctx.input().time - start_time;
+                if duration >= long_press_threshold {
+                    // Open picker at pointer position
+                    ctx.data_mut(|d| {
+                        d.insert_temp(picker_open_key, true);
+                        if let Some(pos) = ctx.input().pointer.latest_pos() {
+                            d.insert_temp(picker_pos_key, pos);
+                        }
+                    });
+                } else {
+                    // Short press: toggle/delete if already filled, otherwise send default reaction
+                    if filled {
+                        action = Some(NoteAction::React(ReactAction::new(
+                            NoteId::new(*note.id()),
+                            "__DELETE__",
+                        )));
+                    } else {
+                        let chosen = reactions[default_idx];
+                        action = Some(NoteAction::React(ReactAction::new(
+                            NoteId::new(*note.id()),
+                            chosen,
+                        )));
+                    }
+                }
+            }
+        }
+
+        // If picker is open, draw it as an overlay
+        if ctx.data(|d| d.get_temp::<bool>(picker_open_key)).unwrap_or(false) {
+            if let Some(pos) = ctx.data(|d| d.get_temp::<egui::Pos2>(picker_pos_key)) {
+                let area_id = ui.id().with(("reaction_picker_area", note_key));
+                egui::Area::new(area_id)
+                    .fixed_pos(pos)
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            for (i, &em) in reactions.iter().enumerate() {
+                                if ui.button(em).clicked() {
+                                    action = Some(NoteAction::React(ReactAction::new(
+                                        NoteId::new(*note.id()),
+                                        em,
+                                    )));
+                                    ctx.data_mut(|d| {
+                                        d.insert_temp(default_idx_key, i as i32);
+                                        d.remove_temp::<bool>(picker_open_key);
+                                    });
+                                }
+                            }
+                            // small cancel button
+                            if ui.button("✖").clicked() {
+                                ctx.data_mut(|d| {
+                                    d.remove_temp::<bool>(picker_open_key);
+                                });
+                            }
+                        });
+                    });
+            }
         }
     }
 

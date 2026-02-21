@@ -185,60 +185,73 @@ fn send_kind_3_event(ndb: &Ndb, pool: &mut RelayPool, accounts: &Accounts, actio
 
     let txn = Transaction::new(ndb).expect("txn");
 
-    let ContactState::Received {
-        contacts: _,
-        note_key,
-        timestamp: _,
-    } = accounts.get_selected_account().data.contacts.get_state()
-    else {
-        return;
-    };
-
-    let contact_note = match ndb.get_note_by_key(&txn, *note_key).ok() {
-        Some(n) => n,
-        None => {
-            tracing::error!(
-                "Somehow we are in state ContactState::Received but the contact note key doesn't exist"
-            );
+    match accounts.get_selected_account().data.contacts.get_state() {
+        ContactState::Unreceived => {
+            // No existing contact list; create a fresh one when following
+            match action {
+                FollowAction::Follow(pubkey) => {
+                    let mut pks_to_follow = vec![*pubkey];
+                    // send_new_contact_list will ensure own kp.pubkey is present
+                    send_new_contact_list(kp, ndb, pool, pks_to_follow);
+                }
+                FollowAction::Unfollow(_) => {
+                    // nothing to unfollow
+                }
+            }
             return;
         }
-    };
-
-    if contact_note.kind() != 3 {
-        tracing::error!(
-            "Something very wrong just occured. The key for the supposed contact note yielded a note which was not a contact..."
-        );
-        return;
-    }
-
-    let builder = match action {
-        FollowAction::Follow(pubkey) => {
-            builder_from_note(contact_note, None::<fn(&nostrdb::Tag<'_>) -> bool>)
-                .start_tag()
-                .tag_str("p")
-                .tag_str(&pubkey.hex())
-        }
-        FollowAction::Unfollow(pubkey) => builder_from_note(
-            contact_note,
-            Some(|tag: &nostrdb::Tag<'_>| {
-                if tag.count() < 2 {
-                    return false;
+        ContactState::Received {
+            contacts: _,
+            note_key,
+            timestamp: _,
+        } => {
+            let contact_note = match ndb.get_note_by_key(&txn, *note_key).ok() {
+                Some(n) => n,
+                None => {
+                    tracing::error!(
+                        "Somehow we are in state ContactState::Received but the contact note key doesn't exist"
+                    );
+                    return;
                 }
+            };
 
-                let Some("p") = tag.get_str(0) else {
-                    return false;
-                };
+            if contact_note.kind() != 3 {
+                tracing::error!(
+                    "Something very wrong just occured. The key for the supposed contact note yielded a note which was not a contact..."
+                );
+                return;
+            }
 
-                let Some(cur_val) = tag.get_id(1) else {
-                    return false;
-                };
+            let builder = match action {
+                FollowAction::Follow(pubkey) => {
+                    builder_from_note(contact_note, None::<fn(&nostrdb::Tag<'_>) -> bool>)
+                        .start_tag()
+                        .tag_str("p")
+                        .tag_str(&pubkey.hex())
+                }
+                FollowAction::Unfollow(pubkey) => builder_from_note(
+                    contact_note,
+                    Some(|tag: &nostrdb::Tag<'_>| {
+                        if tag.count() < 2 {
+                            return false;
+                        }
 
-                cur_val == pubkey.bytes()
-            }),
-        ),
-    };
+                        let Some("p") = tag.get_str(0) else {
+                            return false;
+                        };
 
-    send_note_builder(builder, ndb, pool, kp);
+                        let Some(cur_val) = tag.get_id(1) else {
+                            return false;
+                        };
+
+                        cur_val == pubkey.bytes()
+                    }),
+                ),
+            };
+
+            send_note_builder(builder, ndb, pool, kp);
+        }
+    }
 }
 
 pub fn send_new_contact_list(
