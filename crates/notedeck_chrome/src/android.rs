@@ -9,14 +9,14 @@ use notedeck::Notedeck;
 #[no_mangle]
 #[tokio::main]
 pub async fn android_main(android_app: AndroidApp) {
-    //use tracing_logcat::{LogcatMakeWriter, LogcatTag};
+    use tracing_logcat::{LogcatMakeWriter, LogcatTag};
     use tracing_subscriber::{prelude::*, EnvFilter};
 
     std::env::set_var("RUST_BACKTRACE", "full");
     //std::env::set_var("DAVE_MODEL", "hhao/qwen2.5-coder-tools:latest");
     std::env::set_var(
         "RUST_LOG",
-        "egui=debug,egui-winit=debug,winit=debug,notedeck=debug,notedeck_columns=debug,notedeck_chrome=debug,enostr=debug,android_activity=debug",
+        "egui=debug,egui-winit=debug,winit=debug,notedeck=debug,notedeck_columns=debug,notedeck_chrome=debug,enostr=debug,android_activity=debug,contacts=debug",
     );
 
     //std::env::set_var(
@@ -24,12 +24,17 @@ pub async fn android_main(android_app: AndroidApp) {
     //    "enostr=debug,notedeck_columns=debug,notedeck_chrome=debug",
     //);
 
-    //let writer =
-    //LogcatMakeWriter::new(LogcatTag::Target).expect("Failed to initialize logcat writer");
-
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_level(false)
-        .with_target(false)
+    let logcat_layer = tracing_subscriber::fmt::layer()
+        .with_level(true)
+        .with_target(true)
+        .without_time()
+        .with_writer(
+            LogcatMakeWriter::new(LogcatTag::Target)
+                .expect("Failed to initialize logcat writer"),
+        );
+    let stdout_layer = tracing_subscriber::fmt::layer()
+        .with_level(true)
+        .with_target(true)
         .without_time();
 
     let filter_layer = EnvFilter::try_from_default_env()
@@ -38,8 +43,11 @@ pub async fn android_main(android_app: AndroidApp) {
 
     tracing_subscriber::registry()
         .with(filter_layer)
-        .with(fmt_layer)
+        .with(logcat_layer)
+        .with(stdout_layer)
         .init();
+
+    tracing::info!(target: "contacts", "Tracing initialized");
 
     let _ = android_keyring::set_android_keyring_credential_builder();
 
@@ -58,7 +66,7 @@ pub async fn android_main(android_app: AndroidApp) {
 
     options.android_app = Some(android_app.clone());
 
-    let app_args = get_app_args();
+    let app_args = get_app_args(&android_app);
 
     let _res = eframe::run_native(
         "Damus Notedeck",
@@ -106,49 +114,58 @@ Using internal storage would be better but it seems hard to get the config file 
 the device ...
 */
 
-fn get_app_args() -> Vec<String> {
-    vec!["argv0-placeholder".to_string()]
-    /*
-    use serde_json::value;
+fn get_app_args(app: &AndroidApp) -> Vec<String> {
+    use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
 
-    let external_data_path: pathbuf = app
-        .external_data_path()
-        .expect("external data path")
-        .to_path_buf();
-    let config_file = external_data_path.join("android-config.json");
+    let default_args = vec!["argv0-placeholder".to_string()];
 
-    let initial_user = hex::encode(notedeck::FALLBACK_PUBKEY().bytes());
-    let default_args = vec![
-        "argv0-placeholder",
-        "--no-tmp-columns",
-        "--pub",
-        &initial_user,
-        "-c",
-        "contacts",
-        "-c",
-        "notifications",
-    ]
-    .into_iter()
-    .map(|s| s.to_string())
-    .collect();
+    let Some(external_data_path) = app.external_data_path() else {
+        tracing::debug!(target: "android-config", "No external data path; using defaults");
+        return default_args;
+    };
 
-    if config_file.exists() {
-        if let Ok(config_contents) = fs::read_to_string(config_file) {
-            if let Ok(json) = serde_json::from_str::<Value>(&config_contents) {
-                if let Some(args_array) = json.get("args").and_then(|v| v.as_array()) {
-                    let config_args = args_array
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
+    let config_file: PathBuf = external_data_path.to_path_buf().join("android-config.json");
+    let config_contents = match fs::read_to_string(&config_file) {
+        Ok(contents) => contents,
+        Err(e) => {
+            tracing::debug!(
+                target: "android-config",
+                "No android-config.json at {:?}: {e}",
+                config_file
+            );
+            return default_args;
+        }
+    };
 
-                    return config_args;
-                }
-            }
+    let Ok(json) = serde_json::from_str::<Value>(&config_contents) else {
+        tracing::warn!(
+            target: "android-config",
+            "Could not parse android-config.json; using defaults"
+        );
+        return default_args;
+    };
+
+    if let Some(args_array) = json.get("args").and_then(|v| v.as_array()) {
+        let config_args: Vec<String> = args_array
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        if !config_args.is_empty() {
+            tracing::info!(
+                target: "android-config",
+                "Loaded {} args from android-config.json",
+                config_args.len()
+            );
+            return config_args;
         }
     }
 
-    default_args // Return the default args if config is missing or invalid
-    */
+    tracing::warn!(
+        target: "android-config",
+        "android-config.json present but contained no args; using defaults"
+    );
+    default_args
 }

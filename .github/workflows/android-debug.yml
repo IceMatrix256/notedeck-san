@@ -164,13 +164,24 @@ jobs:
           api-level: 33
           target: google_apis
           arch: x86_64
-          emulator-options: -no-window -no-audio -no-boot-anim
+          emulator-options: -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot
           # provide a script to run while emulator is available; downstream steps will also run even on failure
           script: |
             set -eux
             echo "Emulator started; running install+capture script"
             # wait for emulator device
-            timeout 120s adb wait-for-device || true
+            timeout 300s adb wait-for-device || true
+            echo "adb devices after wait:" && adb devices || true
+            # wait for Android to finish booting (sys.boot_completed=1) up to 300s
+            for i in $(seq 1 60); do
+              boot=$(adb shell getprop sys.boot_completed 2>/dev/null || echo "")
+              echo "boot check $i: '$boot'"
+              if [ "$boot" = "1" ]; then
+                echo "Device booted"
+                break
+              fi
+              sleep 5
+            done
             # install APK from artifact dir if present
             apk=$(find artifact -type f -name "app-debug.apk" | head -n 1 || true)
             if [ -n "$apk" ]; then
@@ -276,12 +287,25 @@ jobs:
           ls -la native_logcat.txt || true
           ls -la pulled || true
           find . -maxdepth 3 -type f \( -name 'native_logcat.txt' -o -name 'notedeck_native.log' -o -name 'notedeck_java.log' \) -print || true
+      - name: Collect emulator log files into workspace
+        if: ${{ always() }}
+        run: |
+          set -eux
+          mkdir -p $GITHUB_WORKSPACE/pulled
+          # Copy any native_logcat.txt found anywhere into workspace
+          find . -type f -name 'native_logcat.txt' -exec cp {} $GITHUB_WORKSPACE/native_logcat.txt \; || true
+          # Merge any pulled dirs into workspace/pulled
+          for d in $(find . -type d -name pulled -print || true); do
+            cp -r "$d/." $GITHUB_WORKSPACE/pulled/ || true
+          done
+          ls -la $GITHUB_WORKSPACE/native_logcat.txt || true
+          ls -la $GITHUB_WORKSPACE/pulled || true
       - name: Upload emulator logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: emulator-logs
           path: |
-            native_logcat.txt
-            pulled
+            ${{ github.workspace }}/native_logcat.txt
+            ${{ github.workspace }}/pulled
 

@@ -42,6 +42,14 @@ public class MainActivity extends GameActivity {
       }
   }
 
+  private void nativeEchoOrLog(String s) {
+      try {
+          nativeEcho(s);
+      } catch (UnsatisfiedLinkError e) {
+          Log.d("native-echo", s);
+      }
+  }
+
   public void vibrate(long durationMs) {
         Vibrator vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
         if (vibrator != null && vibrator.hasVibrator()) {
@@ -191,7 +199,7 @@ public class MainActivity extends GameActivity {
                 Log.d("MainActivityTouch", "view-onTouch action=" + action + " x=" + x + " y=" + y);
                 if (action == MotionEvent.ACTION_DOWN) {
                     try {
-                        nativeEcho("view-touch:" + action + ":" + x + ":" + y);
+                        nativeEchoOrLog("view-touch:" + action + ":" + x + ":" + y);
                     } catch (UnsatisfiedLinkError e) {
                         Log.e("MainActivity", "nativeEcho failed", e);
                     }
@@ -205,7 +213,7 @@ public class MainActivity extends GameActivity {
         // Write a Java-side persistent marker so we can verify startup without native logs.
         writeJavaStartupMarker("startup");
         try {
-            nativeEcho("startup");
+            nativeEchoOrLog("startup");
         } catch (UnsatisfiedLinkError e) {
             Log.e("MainActivity", "nativeEcho failed", e);
         }
@@ -267,7 +275,7 @@ public class MainActivity extends GameActivity {
         Log.d("MainActivityTouch", "dispatch action=" + action + " x=" + x + " y=" + y);
         if (action == MotionEvent.ACTION_DOWN) {
             try {
-                nativeEcho("dispatch-touch:" + action + ":" + x + ":" + y);
+                nativeEchoOrLog("dispatch-touch:" + action + ":" + x + ":" + y);
             } catch (UnsatisfiedLinkError e) {
                 Log.e("MainActivity", "nativeEcho failed", e);
             }
@@ -308,7 +316,7 @@ public class MainActivity extends GameActivity {
         float adjY = event.getY();
         if (action == MotionEvent.ACTION_DOWN) {
             try {
-                nativeEcho("onTouchEvent:" + action + ":" + adjX + ":" + adjY);
+                nativeEchoOrLog("onTouchEvent:" + action + ":" + adjX + ":" + adjY);
             } catch (UnsatisfiedLinkError e) {
                 Log.e("MainActivity", "nativeEcho failed", e);
             }

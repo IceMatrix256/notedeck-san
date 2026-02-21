@@ -46,6 +46,8 @@ impl Contacts {
             .expect("query user relays results");
 
         let Some(res) = binding.first() else {
+            tracing::debug!(target: "contacts", "Contacts query returned no results yet");
+            println!("[contacts] query returned no results yet");
             return;
         };
 
@@ -92,6 +94,17 @@ impl Contacts {
         {
             if *timestamp > note.created_at() {
                 // the current contact list is more up to date than the one we just received. ignore it.
+                tracing::debug!(
+                    target: "contacts",
+                    "Ignoring stale contact list (ts={}, current_ts={})",
+                    note.created_at(),
+                    timestamp
+                );
+                println!(
+                    "[contacts] ignoring stale list ts={} current_ts={}",
+                    note.created_at(),
+                    timestamp
+                );
                 return;
             }
         }
@@ -107,8 +120,20 @@ impl Contacts {
 fn update_state(state: &mut ContactState, note: &Note, key: NoteKey) {
     match state {
         ContactState::Unreceived => {
+            let contacts = get_contacts_owned(note);
+            tracing::info!(
+                target: "contacts",
+                "Received initial contact list with {} entries (ts={})",
+                contacts.len(),
+                note.created_at()
+            );
+            println!(
+                "[contacts] received initial list count={} ts={}",
+                contacts.len(),
+                note.created_at()
+            );
             *state = ContactState::Received {
-                contacts: get_contacts_owned(note),
+                contacts,
                 note_key: key,
                 timestamp: note.created_at(),
             };
@@ -118,7 +143,21 @@ fn update_state(state: &mut ContactState, note: &Note, key: NoteKey) {
             note_key,
             timestamp,
         } => {
+            let before = contacts.len();
             update_contacts(contacts, note);
+            tracing::info!(
+                target: "contacts",
+                "Updated contact list from {} to {} entries (ts={})",
+                before,
+                contacts.len(),
+                note.created_at()
+            );
+            println!(
+                "[contacts] updated list {} -> {} ts={}",
+                before,
+                contacts.len(),
+                note.created_at()
+            );
             *note_key = key;
             *timestamp = note.created_at();
         }
