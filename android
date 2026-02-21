@@ -6,6 +6,6 @@ cargo ndk --target arm64-v8a -o ./crates/notedeck_chrome/android/app/src/main/jn
 
 cd ./crates/notedeck_chrome/android
 
-./gradlew build && ./gradlew installDebug
+./gradlew assembleDebug --no-daemon && adb install --user 0 -r app/build/outputs/apk/debug/app-debug.apk
 
 cd $root_dir

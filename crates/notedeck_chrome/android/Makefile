@@ -8,6 +8,6 @@ apk: jni
 	cd java && ./gradlew build
 
 run-on-device: jni
-	cd java && ./gradlew installDebug
+	cd java && ./gradlew assembleDebug --no-daemon && adb install --user 0 -r app/build/outputs/apk/debug/app-debug.apk
 	adb shell am start -n local.walkers/.MainActivity
 	adb logcat -v color -s walkers RustStdoutStderr
