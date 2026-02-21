@@ -1,0 +1,16 @@
+name: CI Debug Test
+
+on:
+  push:
+    branches:
+      - feature/reactions
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Echo message
+        run: echo "hello from CI debug test"
