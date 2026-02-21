@@ -17,6 +17,7 @@ use notedeck::Images;
 use notedeck::Localization;
 use notedeck::MediaAction;
 use notedeck::{get_current_wallet, MediaJobSender};
+use tracing::info;
 pub use options::NoteOptions;
 pub use reply_description::reply_desc;
 
@@ -1025,15 +1026,18 @@ fn actionbar_ui(
                             d.insert_temp(picker_pos_key, pos);
                         }
                     });
+                    info!("ui: reaction picker opened for note {:?}", note.id());
                 } else {
                     // Short press: toggle/delete if already filled, otherwise send default reaction
                     if filled {
+                        info!("ui: delete reaction for note {:?}", note.id());
                         action = Some(NoteAction::React(ReactAction::new(
                             NoteId::new(*note.id()),
                             "__DELETE__",
                         )));
                     } else {
                         let chosen = reactions[default_idx];
+                        info!("ui: send reaction '{}' for note {:?}", chosen, note.id());
                         action = Some(NoteAction::React(ReactAction::new(
                             NoteId::new(*note.id()),
                             chosen,
@@ -1054,6 +1058,7 @@ fn actionbar_ui(
                         ui.horizontal(|ui| {
                             for (i, &em) in reactions.iter().enumerate() {
                                 if ui.button(em).clicked() {
+                                    info!("ui: picker chose '{}' for note {:?}", em, note.id());
                                     action = Some(NoteAction::React(ReactAction::new(
                                         NoteId::new(*note.id()),
                                         em,
