@@ -62,7 +62,7 @@ pub fn android_log_d(tag: &str, msg: &str) {
                 (Ok(tag_j), Ok(msg_j), Ok(class)) => {
                     let tag_obj = JObject::from(tag_j);
                     let msg_obj = JObject::from(msg_j);
-                    let args = [JValue::Object(tag_obj), JValue::Object(msg_obj)];
+                    let args = [JValue::Object(&tag_obj), JValue::Object(&msg_obj)];
                     if let Err(e) = env.call_static_method(
                         class,
                         "d",
