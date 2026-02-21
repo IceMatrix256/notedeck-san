@@ -1019,14 +1019,50 @@ fn actionbar_ui(
                 ctx.data_mut(|d| d.remove_temp::<f64>(press_start_key));
                 let duration = ctx.input(|i| i.time) - start_time;
                 if duration >= long_press_threshold {
-                    // Open picker at pointer position
-                    ctx.data_mut(|d| {
-                        d.insert_temp(picker_open_key, true);
-                        if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
-                            d.insert_temp(picker_pos_key, pos);
+                    // Open picker at pointer position if we have a valid pointer pos.
+                    if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
+                        if pos.x.is_finite() && pos.y.is_finite() {
+                            ctx.data_mut(|d| {
+                                d.insert_temp(picker_open_key, true);
+                                d.insert_temp(picker_pos_key, pos);
+                            });
+                            info!("ui: reaction picker opened for note {:?}", note.id());
+                        } else {
+                            info!("ui: long press detected but pointer pos invalid, falling back to short-press for note {:?}", note.id());
+                            // Fallback to short-press behaviour
+                            if filled {
+                                info!("ui: delete reaction for note {:?}", note.id());
+                                action = Some(NoteAction::React(ReactAction::new(
+                                    NoteId::new(*note.id()),
+                                    "__DELETE__",
+                                )));
+                            } else {
+                                let chosen = reactions[default_idx];
+                                info!("ui: send reaction '{}' for note {:?}", chosen, note.id());
+                                action = Some(NoteAction::React(ReactAction::new(
+                                    NoteId::new(*note.id()),
+                                    chosen,
+                                )));
+                            }
                         }
-                    });
-                    info!("ui: reaction picker opened for note {:?}", note.id());
+                    } else {
+                        info!("ui: long press detected but no pointer position available, falling back to short-press for note {:?}", note.id());
+                        // Fallback to short-press behaviour
+                        if filled {
+                            info!("ui: delete reaction for note {:?}", note.id());
+                            action = Some(NoteAction::React(ReactAction::new(
+                                NoteId::new(*note.id()),
+                                "__DELETE__",
+                            )));
+                        } else {
+                            let chosen = reactions[default_idx];
+                            info!("ui: send reaction '{}' for note {:?}", chosen, note.id());
+                            action = Some(NoteAction::React(ReactAction::new(
+                                NoteId::new(*note.id()),
+                                chosen,
+                            )));
+                        }
+                    }
                 } else {
                     // Short press: toggle/delete if already filled, otherwise send default reaction
                     if filled {
@@ -1049,8 +1085,19 @@ fn actionbar_ui(
 
         // If picker is open, draw it as an overlay
         if ctx.data(|d| d.get_temp::<bool>(picker_open_key)).unwrap_or(false) {
-            if let Some(pos) = ctx.data(|d| d.get_temp::<egui::Pos2>(picker_pos_key)) {
+            let pos = ctx
+                .data(|d| d.get_temp::<egui::Pos2>(picker_pos_key))
+                .unwrap_or_else(|| {
+                    // fallback to center of available rect if we don't have a stored position
+                    let rect = ui.max_rect();
+                    egui::Pos2::new(rect.center().x, rect.center().y)
+                });
+            if pos.x.is_finite() && pos.y.is_finite() {
                 let area_id = ui.id().with(("reaction_picker_area", note_key));
+                // capture picker selections without mutating ctx inside UI closure
+                let mut picker_chosen: Option<i32> = None;
+                let mut picker_cancelled = false;
+
                 egui::Area::new(area_id)
                     .fixed_pos(pos)
                     .order(egui::Order::Foreground)
@@ -1059,24 +1106,40 @@ fn actionbar_ui(
                             for (i, &em) in reactions.iter().enumerate() {
                                 if ui.button(em).clicked() {
                                     info!("ui: picker chose '{}' for note {:?}", em, note.id());
-                                    action = Some(NoteAction::React(ReactAction::new(
-                                        NoteId::new(*note.id()),
-                                        em,
-                                    )));
-                                    ctx.data_mut(|d| {
-                                        d.insert_temp(default_idx_key, i as i32);
-                                        d.remove_temp::<bool>(picker_open_key);
-                                    });
+                                    // capture selection only; apply action after the UI closure to avoid nested borrows
+                                    picker_chosen = Some(i as i32);
                                 }
                             }
                             // small cancel button
                             if ui.button("✖").clicked() {
-                                ctx.data_mut(|d| {
-                                    d.remove_temp::<bool>(picker_open_key);
-                                });
+                                picker_cancelled = true;
                             }
                         });
                     });
+
+                // Apply changes to ctx.data outside of UI closure to avoid re-entrancy
+                if let Some(idx) = picker_chosen {
+                    // set default index and close picker
+                    ctx.data_mut(|d| {
+                        d.insert_temp(default_idx_key, idx);
+                        d.remove_temp::<bool>(picker_open_key);
+                    });
+                    // apply the actual reaction action outside the UI closure
+                    if let Some(idx_usize) = Some(idx as usize).filter(|&i| i < reactions.len()) {
+                        let chosen = reactions[idx_usize];
+                        info!("ui: send reaction '{}' for note {:?}", chosen, note.id());
+                        action = Some(NoteAction::React(ReactAction::new(
+                            NoteId::new(*note.id()),
+                            chosen,
+                        )));
+                    }
+                }
+                if picker_cancelled {
+                    ctx.data_mut(|d| d.remove_temp::<bool>(picker_open_key));
+                }
+            } else {
+                // invalid position, close picker to avoid panics
+                ctx.data_mut(|d| d.remove_temp::<bool>(picker_open_key));
             }
         }
     }
