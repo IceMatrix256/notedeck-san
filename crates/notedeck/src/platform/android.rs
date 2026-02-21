@@ -6,8 +6,71 @@ use jni::{
 use std::sync::atomic::{AtomicI32, Ordering};
 use tracing::{debug, error, info};
 
+#[link(name = "log")]
+extern "C" {
+    fn __android_log_write(prio: ::std::os::raw::c_int, tag: *const ::std::os::raw::c_char, text: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+}
+
+
 pub fn get_jvm() -> jni::JavaVM {
     unsafe { jni::JavaVM::from_raw(ndk_context::android_context().vm().cast()) }.unwrap()
+}
+
+/// Log a message to Android logcat at DEBUG level using android.util.Log.d
+pub fn android_log_d(tag: &str, msg: &str) {
+    use std::ffi::CString;
+
+    let fallback_write = |t: &str, m: &str| {
+        let c_tag = CString::new(t).unwrap_or_else(|_| CString::new("tag").unwrap());
+        let c_msg = CString::new(m).unwrap_or_else(|_| CString::new("msg").unwrap());
+        unsafe {
+            let _ = __android_log_write(3, c_tag.as_ptr(), c_msg.as_ptr());
+        }
+    };
+
+    // Try to attach to the JVM and call android.util.Log.d(TAG, MSG)
+    let vm = get_jvm();
+    match vm.attach_current_thread() {
+        Ok(mut env) => {
+            use jni::objects::JValue;
+            match (env.new_string(tag), env.new_string(msg), env.find_class("android/util/Log")) {
+                (Ok(tag_j), Ok(msg_j), Ok(class)) => {
+                    if let Err(e) = env.call_static_method(
+                        class,
+                        "d",
+                        "(Ljava/lang/String;Ljava/lang/String;)I",
+                        &[JValue::from(JObject::from(tag_j)), JValue::from(JObject::from(msg_j))],
+                    ) {
+                        // Fallback to native log writer so logs still appear in logcat
+                        eprintln!("android_log_d: call_static_method failed: {:?}", e);
+                        fallback_write(tag, msg);
+                    }
+                }
+                (t_res, m_res, c_res) => {
+                    eprintln!("android_log_d: failed to prepare JNI args: tag_err={:?} msg_err={:?} class_err={:?}", t_res.err(), m_res.err(), c_res.err());
+                    fallback_write(tag, msg);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("android_log_d: attach_current_thread failed: {:?}", e);
+            fallback_write(tag, msg);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn Java_com_damus_notedeck_MainActivity_nativeEcho(mut env: JNIEnv, _class: JClass, jmsg: JString) {
+    // Safely convert incoming Java string and forward to android_log_d
+    match env.get_string(&jmsg) {
+        Ok(jstr) => {
+            let s: String = jstr.into();
+            android_log_d("native-echo", &s);
+        }
+        Err(e) => {
+            android_log_d("native-echo", &format!("failed to read jstring: {:?}", e));
+        }
+    }
 }
 
 // Thread-safe static global

@@ -32,6 +32,15 @@ public class MainActivity extends GameActivity {
 
   private native void nativeOnFilePickedFailed(String uri, String e);
   private native void nativeOnFilePickedWithContent(Object[] uri_info, byte[] content);
+  private native void nativeEcho(String msg);
+
+  static {
+      try {
+          System.loadLibrary("notedeck_chrome");
+      } catch (UnsatisfiedLinkError e) {
+          Log.w("MainActivity", "Failed to load native library notedeck_chrome", e);
+      }
+  }
 
   public void vibrate(long durationMs) {
         Vibrator vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
@@ -171,6 +180,33 @@ public class MainActivity extends GameActivity {
         //setupFullscreen()
 
         super.onCreate(savedInstanceState);
+
+        // Attach an onTouchListener to the content view to capture touch events sent to the view.
+        View content = getContent();
+        if (content != null) {
+            content.setOnTouchListener((v, event) -> {
+                int action = event.getActionMasked();
+                float x = event.getX();
+                float y = event.getY();
+                Log.d("MainActivityTouch", "view-onTouch action=" + action + " x=" + x + " y=" + y);
+                if (action == MotionEvent.ACTION_DOWN) {
+                    try {
+                        nativeEcho("view-touch:" + action + ":" + x + ":" + y);
+                    } catch (UnsatisfiedLinkError e) {
+                        Log.e("MainActivity", "nativeEcho failed", e);
+                    }
+                }
+                return false; // don't consume the event so the app still processes it
+            });
+        }
+
+        // Try to call a small native echo to verify native logging is available. If the native lib
+        // isn't loaded this will throw UnsatisfiedLinkError which we catch and log.
+        try {
+            nativeEcho("startup");
+        } catch (UnsatisfiedLinkError e) {
+            Log.e("MainActivity", "nativeEcho failed", e);
+        }
     }
 
     @Override
@@ -222,6 +258,22 @@ public class MainActivity extends GameActivity {
     }
 
     @Override
+    public boolean dispatchTouchEvent(MotionEvent ev) {
+        int action = ev.getActionMasked();
+        float x = ev.getX();
+        float y = ev.getY();
+        Log.d("MainActivityTouch", "dispatch action=" + action + " x=" + x + " y=" + y);
+        if (action == MotionEvent.ACTION_DOWN) {
+            try {
+                nativeEcho("dispatch-touch:" + action + ":" + x + ":" + y);
+            } catch (UnsatisfiedLinkError e) {
+                Log.e("MainActivity", "nativeEcho failed", e);
+            }
+        }
+        return super.dispatchTouchEvent(ev);
+    }
+
+    @Override
     public void onResume() {
         super.onResume();
     }
@@ -238,11 +290,27 @@ public class MainActivity extends GameActivity {
 
     @Override
     public boolean onTouchEvent(MotionEvent event) {
+        // Log touch for debugging
+        int action = event.getActionMasked();
+        float x = event.getX();
+        float y = event.getY();
+        Log.d("MainActivityTouch", "action=" + action + " x=" + x + " y=" + y);
+
         // Offset the location so it fits the view with margins caused by insets.
 
         int[] location = new int[2];
         findViewById(android.R.id.content).getLocationOnScreen(location);
         event.offsetLocation(-location[0], -location[1]);
+
+        float adjX = event.getX();
+        float adjY = event.getY();
+        if (action == MotionEvent.ACTION_DOWN) {
+            try {
+                nativeEcho("onTouchEvent:" + action + ":" + adjX + ":" + adjY);
+            } catch (UnsatisfiedLinkError e) {
+                Log.e("MainActivity", "nativeEcho failed", e);
+            }
+        }
 
         return super.onTouchEvent(event);
     }
