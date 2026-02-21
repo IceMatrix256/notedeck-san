@@ -1012,17 +1012,17 @@ fn actionbar_ui(
         // Track press start time when pointer is down
         if like_resp.is_pointer_button_down_on() {
             if ctx.data(|d| d.get_temp::<f64>(press_start_key)).is_none() {
-                ctx.data_mut(|d| d.insert_temp(press_start_key, ctx.input().time));
+                ctx.data_mut(|d| d.insert_temp(press_start_key, ctx.input(|i| i.time)));
             }
         } else {
             if let Some(start_time) = ctx.data(|d| d.get_temp::<f64>(press_start_key)) {
                 ctx.data_mut(|d| d.remove_temp::<f64>(press_start_key));
-                let duration = ctx.input().time - start_time;
+                let duration = ctx.input(|i| i.time) - start_time;
                 if duration >= long_press_threshold {
                     // Open picker at pointer position
                     ctx.data_mut(|d| {
                         d.insert_temp(picker_open_key, true);
-                        if let Some(pos) = ctx.input().pointer.latest_pos() {
+                        if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
                             d.insert_temp(picker_pos_key, pos);
                         }
                     });
