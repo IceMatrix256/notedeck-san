@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feature/reactions
+  workflow_dispatch:
 
 jobs:
   build-apk:
