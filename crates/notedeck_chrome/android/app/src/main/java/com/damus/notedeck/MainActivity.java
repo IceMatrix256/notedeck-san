@@ -202,6 +202,8 @@ public class MainActivity extends GameActivity {
 
         // Try to call a small native echo to verify native logging is available. If the native lib
         // isn't loaded this will throw UnsatisfiedLinkError which we catch and log.
+        // Write a Java-side persistent marker so we can verify startup without native logs.
+        writeJavaStartupMarker("startup");
         try {
             nativeEcho("startup");
         } catch (UnsatisfiedLinkError e) {
@@ -313,5 +315,21 @@ public class MainActivity extends GameActivity {
         }
 
         return super.onTouchEvent(event);
+    }
+
+    private void writeJavaStartupMarker(String msg) {
+        try {
+            String dir = "/sdcard/Android/data/com.damus.notedeck/files";
+            java.io.File d = new java.io.File(dir);
+            if (!d.exists()) d.mkdirs();
+            java.io.File f = new java.io.File(d, "notedeck_java.log");
+            java.io.FileWriter fw = new java.io.FileWriter(f, true);
+            fw.write("[JAVA] " + msg + "\n");
+            fw.flush();
+            fw.close();
+            Log.d("MainActivity", "Wrote java startup marker to " + f.getAbsolutePath());
+        } catch (IOException e) {
+            Log.e("MainActivity", "Failed to write java startup marker", e);
+        }
     }
 }

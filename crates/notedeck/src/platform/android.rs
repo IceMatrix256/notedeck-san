@@ -1,3 +1,4 @@
+#[cfg(target_os = "android")]
 use crate::platform::{file::emit_selected_file, SelectedMedia};
 use jni::{
     objects::{JByteArray, JClass, JObject, JObjectArray, JString},
@@ -5,6 +6,20 @@ use jni::{
 };
 use std::sync::atomic::{AtomicI32, Ordering};
 use tracing::{debug, error, info};
+use std::fs::OpenOptions;
+use std::io::Write;
+
+// A no_mangle static byte string so the marker appears in the compiled .so strings.
+// This helps verify the native library includes our instrumentation.
+#[no_mangle]
+#[used]
+pub static NATIVE_ECHO_MARKER: [u8; 12] = *b"native-echo\0";
+
+#[no_mangle]
+pub extern "C" fn get_native_echo_marker() -> *const u8 {
+    NATIVE_ECHO_MARKER.as_ptr() as *const u8
+}
+
 
 #[link(name = "log")]
 extern "C" {
@@ -26,6 +41,16 @@ pub fn android_log_d(tag: &str, msg: &str) {
         unsafe {
             let _ = __android_log_write(3, c_tag.as_ptr(), c_msg.as_ptr());
         }
+        // Also try to persist logs to the app external files directory so they can be
+        // retrieved with `adb pull` if logcat entries are missing.
+        let _ = (|| -> std::io::Result<()> {
+            let dir = "/sdcard/Android/data/com.damus.notedeck/files";
+            std::fs::create_dir_all(dir)?;
+            let path = format!("{}/notedeck_native.log", dir);
+            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+            writeln!(file, "[{}] {}", t, m)?;
+            Ok(())
+        })().map_err(|e| eprintln!("android_log_d: failed to write fallback log file: {:?}", e));
     };
 
     // Try to attach to the JVM and call android.util.Log.d(TAG, MSG)
@@ -209,6 +234,17 @@ pub extern "C" fn JNI_OnLoad(_vm: *mut jni::sys::JavaVM, _reserved: *mut std::os
         let c_msg = CString::new("JNI_OnLoad called").unwrap_or_else(|_| CString::new("loaded").unwrap());
         let _ = __android_log_write(3, c_tag.as_ptr(), c_msg.as_ptr());
     }
+
+    // Also attempt to write a short record into the app external files area for
+    // offline inspection via adb if logcat isn't showing the message.
+    let _ = (|| -> std::io::Result<()> {
+        let dir = "/sdcard/Android/data/com.damus.notedeck/files";
+        std::fs::create_dir_all(dir)?;
+        let path = format!("{}/notedeck_native.log", dir);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        writeln!(file, "[JNI] JNI_OnLoad called")?;
+        Ok(())
+    })().map_err(|e| eprintln!("JNI_OnLoad: failed to write fallback log file: {:?}", e));
 
     jni::sys::JNI_VERSION_1_6
 }

@@ -61,18 +61,19 @@ jobs:
       - name: Add Rust Android targets
         run: |
           set -eux
-          rustup target add aarch64-linux-android armv7-linux-androideabi || true
+          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android || true
 
-      - name: Build Rust native libs (arm64 + armeabi) (required)
+      - name: Build Rust native libs (arm64 + armeabi + x86 + x86_64) (required)
         working-directory: ${{ github.workspace }}
         run: |
           set -eux
           mkdir -p crates/notedeck_chrome/android/app/src/main/jniLibs
-          cargo ndk -t arm64-v8a -o ./crates/notedeck_chrome/android/app/src/main/jniLibs build --release
-          cargo ndk -t armeabi-v7a -o ./crates/notedeck_chrome/android/app/src/main/jniLibs build --release
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 -o ./crates/notedeck_chrome/android/app/src/main/jniLibs build --release
           ls -la ./crates/notedeck_chrome/android/app/src/main/jniLibs || true
           test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/arm64-v8a/libnotedeck_chrome.so
           test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/armeabi-v7a/libnotedeck_chrome.so
+          test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/x86/libnotedeck_chrome.so
+          test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/x86_64/libnotedeck_chrome.so
 
       - name: Build Android app (assembleDebug)
         working-directory: crates/notedeck_chrome/android
@@ -98,8 +99,88 @@ jobs:
             done
           fi
 
+      - name: Save native lib strings for inspection
+        run: |
+          set -eux
+          mkdir -p artifacts/native-strings
+          for so in ./crates/notedeck_chrome/android/app/src/main/jniLibs/*/*.so; do
+            arch=$(basename $(dirname "$so"))
+            strings "$so" | sed -n '1,200p' > "artifacts/native-strings/${arch}.txt" || true
+          done
+        continue-on-error: true
+
+      - name: Upload native-strings
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-strings
+          path: artifacts/native-strings
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: debug-apk
           path: crates/notedeck_chrome/android/app/build/outputs/apk/debug/app-debug.apk
+
+  run-emulator:
+    needs: build-apk
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download debug APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: debug-apk
+          path: artifact
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Start Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 33
+          target: google_apis
+          arch: x86_64
+          emulator-options: -no-window -no-audio -no-boot-anim
+      - name: Find APK
+        run: |
+          set -eux
+          apk=$(find . -type f -name "app-debug.apk" | head -n 1)
+          echo "APK => $apk"
+          ls -la "$apk"
+          echo "APK_PATH=$apk" >> $GITHUB_ENV
+      - name: Install APK on emulator
+        run: |
+          set -eux
+          adb wait-for-device
+          adb install -r "$APK_PATH"
+      - name: Start app
+        run: |
+          set -eux
+          adb shell am start -n com.damus.notedeck/.MainActivity || true
+      - name: Clear logcat
+        run: adb logcat -c
+      - name: Capture logcat and exercise UI
+        run: |
+          set -eux
+          adb logcat -v time | grep --line-buffered -E "native-echo|notedeck_java|notedeck_native|MainActivity" > native_logcat.txt &
+          pid=$!
+          sleep 2
+          adb shell input tap 200 400 || true
+          adb shell input swipe 200 400 200 400 1500 || true
+          sleep 10
+          kill $pid || true
+      - name: Pull external native log files
+        run: |
+          set -eux
+          mkdir -p pulled
+          adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_native.log pulled/ || true
+          adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_java.log pulled/ || true
+      - name: Upload emulator logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-logs
+          path: |
+            native_logcat.txt
+            pulled
+

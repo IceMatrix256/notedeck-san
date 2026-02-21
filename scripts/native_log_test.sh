@@ -41,3 +41,9 @@ fi
 
 echo "Log capture running as PID $LOG_PID. Press Ctrl-C to stop and save native_logcat.txt"
 wait $LOG_PID
+
+echo "Attempting to pull persistent native log file from device to ./notedeck_native.log"
+adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_native.log notedeck_native.log || echo "No persistent native log found on device"
+
+echo "Attempting to read internal app file via run-as into notedeck_native_internal.log (requires debuggable app)"
+adb shell run-as com.damus.notedeck cat /data/data/com.damus.notedeck/files/notedeck_native.log > notedeck_native_internal.log 2>/dev/null || echo "run-as internal log read failed; you can try: adb shell run-as com.damus.notedeck cat /data/data/com.damus.notedeck/files/notedeck_native.log"
