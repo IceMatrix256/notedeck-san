@@ -1006,7 +1006,7 @@ fn actionbar_ui(
         let press_start_key = egui::Id::new(("like_press_start", note_key));
         let picker_open_key = egui::Id::new(("reaction_picker_open", note_key));
         let picker_pos_key = egui::Id::new(("reaction_picker_pos", note_key));
-        let long_press_threshold = 0.6_f64;
+        let long_press_threshold = 0.4_f64;
 
         // Track press start time when pointer is down
         if like_resp.is_pointer_button_down_on() {
