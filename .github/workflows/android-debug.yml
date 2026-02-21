@@ -198,20 +198,41 @@ jobs:
         if: ${{ always() }}
         run: |
           set -eux
-          (timeout 60s adb logcat -v time | grep --line-buffered -E "native-echo|notedeck_java|notedeck_native|MainActivity" > native_logcat.txt) &
-          pid=$!
-          sleep 2
+          # allow app to start and produce logs
+          sleep 3
           adb shell input tap 200 400 || true
           adb shell input swipe 200 400 200 400 1500 || true
-          sleep 10
-          kill $pid || true
+          sleep 2
+          # dump buffered logs to file (reliable, exits)
+          adb logcat -v time -d | grep -E "native-echo|notedeck_java|notedeck_native|MainActivity" > native_logcat.txt || true
+          ls -la native_logcat.txt || true
+          echo "native_logcat lines:" && wc -l native_logcat.txt || true
+          head -n 200 native_logcat.txt || true
       - name: Pull external native log files
         if: ${{ always() }}
         run: |
           set -eux
           mkdir -p pulled
-          timeout 10s adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_native.log pulled/ || true
-          timeout 10s adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_java.log pulled/ || true
+          # list remote files for diagnostics
+          adb shell ls -la /sdcard/Android/data/com.damus.notedeck/files || true
+          # retry pulling each file up to 5 times
+          for f in notedeck_native.log notedeck_java.log; do
+            for i in 1 2 3 4 5; do
+              timeout 10s adb pull /sdcard/Android/data/com.damus.notedeck/files/$f pulled/ && break || {
+                echo "pull failed for $f attempt $i"
+                sleep 2
+              }
+            done
+          done
+          ls -la pulled || true
+      - name: Diagnostics before upload
+        if: ${{ always() }}
+        run: |
+          set -eux
+          echo "Workspace: $GITHUB_WORKSPACE"
+          ls -la native_logcat.txt || true
+          ls -la pulled || true
+          find . -maxdepth 3 -type f \( -name 'native_logcat.txt' -o -name 'notedeck_native.log' -o -name 'notedeck_java.log' \) -print || true
       - name: Upload emulator logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
