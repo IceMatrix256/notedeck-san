@@ -63,16 +63,13 @@ jobs:
           set -eux
           rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android || true
 
-      - name: Build Rust native libs (arm64 + armeabi + x86 + x86_64) (required)
+      - name: Build Rust native libs (x86_64 only, temporary)
         working-directory: ${{ github.workspace }}
         run: |
           set -eux
           mkdir -p crates/notedeck_chrome/android/app/src/main/jniLibs
-          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 -o ./crates/notedeck_chrome/android/app/src/main/jniLibs build --release
+          cargo ndk -t x86_64 -o ./crates/notedeck_chrome/android/app/src/main/jniLibs build --release
           ls -la ./crates/notedeck_chrome/android/app/src/main/jniLibs || true
-          test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/arm64-v8a/libnotedeck_chrome.so
-          test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/armeabi-v7a/libnotedeck_chrome.so
-          test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/x86/libnotedeck_chrome.so
           test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/x86_64/libnotedeck_chrome.so
 
       - name: Build Android app (assembleDebug)
@@ -189,13 +186,17 @@ jobs:
             adb shell input tap 200 400 || true
             adb shell input swipe 200 400 200 400 1500 || true
             sleep 2
-            adb logcat -v time -d | grep -E "native-echo|notedeck_java|notedeck_native|MainActivity" > native_logcat.txt || true
+            adb logcat -v time -d > native_logcat_full.txt || true
+            grep -E "native-echo|notedeck_java|notedeck_native|MainActivity" native_logcat_full.txt > native_logcat.txt || true
+            if [ ! -s native_logcat.txt ]; then head -n 500 native_logcat_full.txt > native_logcat.txt || true; fi
             ls -la native_logcat.txt || true
             echo "native_logcat lines:" && wc -l native_logcat.txt || true
             head -n 200 native_logcat.txt || true
-            # pull persistent fallback logs with retries
+            # pull persistent fallback logs with retries (wait for files to appear first)
             mkdir -p pulled
             adb shell ls -la /sdcard/Android/data/com.damus.notedeck/files || true
+            # wait up to 60s for any fallback files to exist
+            timeout 60s bash -c 'until adb shell test -e /sdcard/Android/data/com.damus.notedeck/files/notedeck_native.log || adb shell test -e /sdcard/Android/data/com.damus.notedeck/files/notedeck_java.log; do sleep 2; done' || true
             for f in notedeck_native.log notedeck_java.log; do
               for i in 1 2 3 4 5; do
                 timeout 10s adb pull /sdcard/Android/data/com.damus.notedeck/files/$f pulled/ && break || {
@@ -239,7 +240,12 @@ jobs:
           adb shell input swipe 200 400 200 400 1500 || true
           sleep 2
           # dump buffered logs to file (reliable, exits)
-          adb logcat -v time -d | grep -E "native-echo|notedeck_java|notedeck_native|MainActivity" > native_logcat.txt || true
+          adb logcat -v time -d > native_logcat_full.txt || true
+          grep -E "native-echo|notedeck_java|notedeck_native|MainActivity" native_logcat_full.txt > native_logcat.txt || true
+          if [ ! -s native_logcat.txt ]; then head -n 500 native_logcat_full.txt > native_logcat.txt || true; fi
+          ls -la native_logcat.txt || true
+          echo "native_logcat lines:" && wc -l native_logcat.txt || true
+          head -n 200 native_logcat.txt || true
           ls -la native_logcat.txt || true
           echo "native_logcat lines:" && wc -l native_logcat.txt || true
           head -n 200 native_logcat.txt || true
@@ -250,6 +256,8 @@ jobs:
           mkdir -p pulled
           # list remote files for diagnostics
           adb shell ls -la /sdcard/Android/data/com.damus.notedeck/files || true
+          # wait up to 60s for any fallback file to appear before pulling
+          timeout 60s bash -c 'until adb shell test -e /sdcard/Android/data/com.damus.notedeck/files/notedeck_native.log || adb shell test -e /sdcard/Android/data/com.damus.notedeck/files/notedeck_java.log; do sleep 2; done' || true
           # retry pulling each file up to 5 times
           for f in notedeck_native.log notedeck_java.log; do
             for i in 1 2 3 4 5; do
