@@ -167,6 +167,9 @@ jobs:
           target: google_apis
           arch: x86_64
           emulator-options: -no-window -no-audio -no-boot-anim
+          # provide a minimal required script so the action doesn't fail; further steps will perform installs and checks
+          script: |
+            echo "Emulator started; continuing with downstream steps"
       - name: Find APK
         run: |
           set -eux
