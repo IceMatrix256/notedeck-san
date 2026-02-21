@@ -1,0 +1,105 @@
+name: Android Debug APK (feature/reactions)
+
+on:
+  push:
+    branches:
+      - feature/reactions
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install required packages
+        run: sudo apt-get update && sudo apt-get install -y unzip libncurses5 jq
+
+      - name: Install Android SDK cmdline-tools and packages
+        run: |
+          SDK_ROOT="${{ github.workspace }}/android-sdk"
+          mkdir -p "$SDK_ROOT/cmdline-tools"
+          cd "$SDK_ROOT"
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip
+          mkdir -p cmdline-tools/latest
+          mv cmdline-tools/* cmdline-tools/latest/ || true
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-33" "build-tools;33.0.2" "ndk;25.2.9519653"
+
+      - name: Set ANDROID_NDK_HOME and create local.properties
+        run: |
+          SDK_ROOT="${{ github.workspace }}/android-sdk"
+          NDK_DIR=$(ls -d "$SDK_ROOT/ndk"/* | sort -V | tail -n 1)
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
+          echo "sdk.dir=$SDK_ROOT" > crates/notedeck_chrome/android/local.properties
+
+      - name: Debug: list installed SDK components
+        run: |
+          echo "SDK root: ${{ github.workspace }}/android-sdk"
+          ${{ github.workspace }}/android-sdk/cmdline-tools/latest/bin/sdkmanager --sdk_root=${{ github.workspace }}/android-sdk --list || true
+
+      - name: Install Rust and cargo-ndk
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Add Rust Android targets
+        run: |
+          set -eux
+          rustup target add aarch64-linux-android armv7-linux-androideabi || true
+
+      - name: Build Rust native libs (arm64 + armeabi) (required)
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -eux
+          mkdir -p crates/notedeck_chrome/android/app/src/main/jniLibs
+          cargo ndk -t arm64-v8a -o ./crates/notedeck_chrome/android/app/src/main/jniLibs build --release
+          cargo ndk -t armeabi-v7a -o ./crates/notedeck_chrome/android/app/src/main/jniLibs build --release
+          ls -la ./crates/notedeck_chrome/android/app/src/main/jniLibs || true
+          test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/arm64-v8a/libnotedeck_chrome.so
+          test -f ./crates/notedeck_chrome/android/app/src/main/jniLibs/armeabi-v7a/libnotedeck_chrome.so
+
+      - name: Build Android app (assembleDebug)
+        working-directory: crates/notedeck_chrome/android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Cleanup old debug artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          repo="${{ github.repository }}"
+          token="${{ secrets.GITHUB_TOKEN }}"
+          artifacts_json=$(curl -s -H "Authorization: token $token" "https://api.github.com/repos/$repo/actions/artifacts")
+          ids_to_delete=$(echo "$artifacts_json" | jq -r '[.artifacts[] | select(.name=="debug-apk")] | sort_by(.created_at) | reverse | .[3:] | .[].id' || true)
+          if [ -z "$ids_to_delete" ]; then
+            echo "No artifacts to delete"
+          else
+            for id in $ids_to_delete; do
+              echo "Deleting artifact $id"
+              curl -s -X DELETE -H "Authorization: token $token" "https://api.github.com/repos/$repo/actions/artifacts/$id" || true
+            done
+          fi
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apk
+          path: crates/notedeck_chrome/android/app/build/outputs/apk/debug/app-debug.apk
