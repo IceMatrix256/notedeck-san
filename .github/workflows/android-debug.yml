@@ -150,6 +150,16 @@ jobs:
           export ANDROID_SDK_ROOT="$SDK_ROOT"
           export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
           yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-33" "build-tools;33.0.2"
+          # Persist tool locations for subsequent steps and actions
+          echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin" >> $GITHUB_PATH
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> $GITHUB_PATH
+      - name: Debug: show PATH and adb
+        run: |
+          echo "PATH=$PATH"
+          which adb || true
+          ls -la $ANDROID_SDK_ROOT/platform-tools || true
+          adb --version || true
+
       - name: Start Android emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -192,6 +202,7 @@ jobs:
           adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_native.log pulled/ || true
           adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_java.log pulled/ || true
       - name: Upload emulator logs
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: emulator-logs
