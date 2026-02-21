@@ -197,3 +197,19 @@ pub fn open_file_picker() -> std::result::Result<(), Box<dyn std::error::Error>>
 
     Ok(())
 }
+
+#[no_mangle]
+pub extern "C" fn JNI_OnLoad(_vm: *mut jni::sys::JavaVM, _reserved: *mut std::os::raw::c_void) -> jni::sys::jint {
+    use std::ffi::CString;
+    // Write a small native log entry so we can verify the .so was loaded even if
+    // JNI attach or android.util.Log.d calls fail. __android_log_write should be
+    // available on Android platforms via liblog.
+    unsafe {
+        let c_tag = CString::new("JNI").unwrap_or_else(|_| CString::new("JNI").unwrap());
+        let c_msg = CString::new("JNI_OnLoad called").unwrap_or_else(|_| CString::new("loaded").unwrap());
+        let _ = __android_log_write(3, c_tag.as_ptr(), c_msg.as_ptr());
+    }
+
+    jni::sys::JNI_VERSION_1_6
+}
+
