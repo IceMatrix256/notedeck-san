@@ -124,6 +124,9 @@ jobs:
   run-emulator:
     needs: build-apk
     runs-on: ubuntu-latest
+    env:
+      ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+      ANDROID_HOME: ${{ github.workspace }}/android-sdk
     steps:
       - name: Download debug APK artifact
         uses: actions/download-artifact@v4
@@ -135,6 +138,18 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Install Android SDK cmdline-tools and packages
+        run: |
+          SDK_ROOT="${{ github.workspace }}/android-sdk"
+          mkdir -p "$SDK_ROOT/cmdline-tools"
+          cd "$SDK_ROOT"
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip
+          mkdir -p cmdline-tools/latest
+          mv cmdline-tools/* cmdline-tools/latest/ || true
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "platforms;android-33" "build-tools;33.0.2"
       - name: Start Android emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
