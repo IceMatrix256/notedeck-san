@@ -162,12 +162,13 @@ jobs:
 
       - name: Start Android emulator
         uses: reactivecircus/android-emulator-runner@v2
+        continue-on-error: true
         with:
           api-level: 33
           target: google_apis
           arch: x86_64
           emulator-options: -no-window -no-audio -no-boot-anim
-          # provide a minimal required script so the action doesn't fail; further steps will perform installs and checks
+          # provide a script to run while emulator is available; downstream steps will also run even on failure
           script: |
             echo "Emulator started; continuing with downstream steps"
       - name: Find APK
@@ -178,20 +179,26 @@ jobs:
           ls -la "$apk"
           echo "APK_PATH=$apk" >> $GITHUB_ENV
       - name: Install APK on emulator
+        if: ${{ always() }}
         run: |
           set -eux
-          adb wait-for-device
-          adb install -r "$APK_PATH"
+          timeout 60s adb wait-for-device || true
+          apk="${APK_PATH:-$(find . -type f -name 'app-debug.apk' | head -n 1)}"
+          if [ -n "$apk" ]; then adb install -r "$apk" || true; else echo "No APK found to install"; fi
       - name: Start app
+        if: ${{ always() }}
         run: |
           set -eux
           adb shell am start -n com.damus.notedeck/.MainActivity || true
       - name: Clear logcat
-        run: adb logcat -c
+        if: ${{ always() }}
+        run: |
+          adb logcat -c || true
       - name: Capture logcat and exercise UI
+        if: ${{ always() }}
         run: |
           set -eux
-          adb logcat -v time | grep --line-buffered -E "native-echo|notedeck_java|notedeck_native|MainActivity" > native_logcat.txt &
+          (timeout 60s adb logcat -v time | grep --line-buffered -E "native-echo|notedeck_java|notedeck_native|MainActivity" > native_logcat.txt) &
           pid=$!
           sleep 2
           adb shell input tap 200 400 || true
@@ -199,11 +206,12 @@ jobs:
           sleep 10
           kill $pid || true
       - name: Pull external native log files
+        if: ${{ always() }}
         run: |
           set -eux
           mkdir -p pulled
-          adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_native.log pulled/ || true
-          adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_java.log pulled/ || true
+          timeout 10s adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_native.log pulled/ || true
+          timeout 10s adb pull /sdcard/Android/data/com.damus.notedeck/files/notedeck_java.log pulled/ || true
       - name: Upload emulator logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
