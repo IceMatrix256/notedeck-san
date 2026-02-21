@@ -1012,12 +1012,15 @@ fn actionbar_ui(
         // Track press start time when pointer is down
         if like_resp.is_pointer_button_down_on() {
             if ctx.data(|d| d.get_temp::<f64>(press_start_key)).is_none() {
-                ctx.data_mut(|d| d.insert_temp(press_start_key, ctx.input(|i| i.time)));
+                let start_time = ctx.input(|i| i.time);
+                ctx.data_mut(|d| d.insert_temp(press_start_key, start_time));
+                info!("ui: press_start recorded {} for note {:?}", start_time, note.id());
             }
         } else {
             if let Some(start_time) = ctx.data(|d| d.get_temp::<f64>(press_start_key)) {
                 ctx.data_mut(|d| d.remove_temp::<f64>(press_start_key));
                 let duration = ctx.input(|i| i.time) - start_time;
+                info!("ui: press_release duration {} for note {:?}", duration, note.id());
                 if duration >= long_press_threshold {
                     // Open picker at pointer position if we have a valid pointer pos.
                     if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
@@ -1028,40 +1031,19 @@ fn actionbar_ui(
                             });
                             info!("ui: reaction picker opened for note {:?}", note.id());
                         } else {
-                            info!("ui: long press detected but pointer pos invalid, falling back to short-press for note {:?}", note.id());
-                            // Fallback to short-press behaviour
-                            if filled {
-                                info!("ui: delete reaction for note {:?}", note.id());
-                                action = Some(NoteAction::React(ReactAction::new(
-                                    NoteId::new(*note.id()),
-                                    "__DELETE__",
-                                )));
-                            } else {
-                                let chosen = reactions[default_idx];
-                                info!("ui: send reaction '{}' for note {:?}", chosen, note.id());
-                                action = Some(NoteAction::React(ReactAction::new(
-                                    NoteId::new(*note.id()),
-                                    chosen,
-                                )));
-                            }
+                            info!("ui: long press detected but pointer pos invalid, opening picker at center for note {:?}", note.id());
+                            ctx.data_mut(|d| {
+                                d.insert_temp(picker_open_key, true);
+                                // Do not set picker_pos_key so overlay will fallback to center
+                                d.remove_temp::<egui::Pos2>(picker_pos_key);
+                            });
                         }
                     } else {
-                        info!("ui: long press detected but no pointer position available, falling back to short-press for note {:?}", note.id());
-                        // Fallback to short-press behaviour
-                        if filled {
-                            info!("ui: delete reaction for note {:?}", note.id());
-                            action = Some(NoteAction::React(ReactAction::new(
-                                NoteId::new(*note.id()),
-                                "__DELETE__",
-                            )));
-                        } else {
-                            let chosen = reactions[default_idx];
-                            info!("ui: send reaction '{}' for note {:?}", chosen, note.id());
-                            action = Some(NoteAction::React(ReactAction::new(
-                                NoteId::new(*note.id()),
-                                chosen,
-                            )));
-                        }
+                        info!("ui: long press detected but no pointer position available, opening picker at center for note {:?}", note.id());
+                        ctx.data_mut(|d| {
+                            d.insert_temp(picker_open_key, true);
+                            d.remove_temp::<egui::Pos2>(picker_pos_key);
+                        });
                     }
                 } else {
                     // Short press: toggle/delete if already filled, otherwise send default reaction
