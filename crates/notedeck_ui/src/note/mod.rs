@@ -1015,12 +1015,14 @@ fn actionbar_ui(
                 let start_time = ctx.input(|i| i.time);
                 ctx.data_mut(|d| d.insert_temp(press_start_key, start_time));
                 info!("ui: press_start recorded {} for note {:?}", start_time, note.id());
+                notedeck::platform::android::android_log_d("ui", &format!("press_start recorded {} for note {:?}", start_time, note.id()));
             }
         } else {
             if let Some(start_time) = ctx.data(|d| d.get_temp::<f64>(press_start_key)) {
                 ctx.data_mut(|d| d.remove_temp::<f64>(press_start_key));
                 let duration = ctx.input(|i| i.time) - start_time;
                 info!("ui: press_release duration {} for note {:?}", duration, note.id());
+                notedeck::platform::android::android_log_d("ui", &format!("press_release duration {} for note {:?}", duration, note.id()));
                 if duration >= long_press_threshold {
                     // Open picker at pointer position if we have a valid pointer pos.
                     if let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) {
@@ -1030,8 +1032,10 @@ fn actionbar_ui(
                                 d.insert_temp(picker_pos_key, pos);
                             });
                             info!("ui: reaction picker opened for note {:?}", note.id());
+                            notedeck::platform::android::android_log_d("ui", &format!("reaction picker opened for note {:?}", note.id()));
                         } else {
                             info!("ui: long press detected but pointer pos invalid, opening picker at center for note {:?}", note.id());
+                            notedeck::platform::android::android_log_d("ui", &format!("long press detected but pointer pos invalid, opening picker at center for note {:?}", note.id()));
                             ctx.data_mut(|d| {
                                 d.insert_temp(picker_open_key, true);
                                 // Do not set picker_pos_key so overlay will fallback to center
@@ -1040,6 +1044,7 @@ fn actionbar_ui(
                         }
                     } else {
                         info!("ui: long press detected but no pointer position available, opening picker at center for note {:?}", note.id());
+                        notedeck::platform::android::android_log_d("ui", &format!("long press detected but no pointer position available, opening picker at center for note {:?}", note.id()));
                         ctx.data_mut(|d| {
                             d.insert_temp(picker_open_key, true);
                             d.remove_temp::<egui::Pos2>(picker_pos_key);
@@ -1049,6 +1054,7 @@ fn actionbar_ui(
                     // Short press: toggle/delete if already filled, otherwise send default reaction
                     if filled {
                         info!("ui: delete reaction for note {:?}", note.id());
+                        notedeck::platform::android::android_log_d("ui", &format!("delete reaction for note {:?}", note.id()));
                         action = Some(NoteAction::React(ReactAction::new(
                             NoteId::new(*note.id()),
                             "__DELETE__",
@@ -1056,6 +1062,7 @@ fn actionbar_ui(
                     } else {
                         let chosen = reactions[default_idx];
                         info!("ui: send reaction '{}' for note {:?}", chosen, note.id());
+                        notedeck::platform::android::android_log_d("ui", &format!("send reaction '{}' for note {:?}", chosen, note.id()));
                         action = Some(NoteAction::React(ReactAction::new(
                             NoteId::new(*note.id()),
                             chosen,
@@ -1088,6 +1095,7 @@ fn actionbar_ui(
                             for (i, &em) in reactions.iter().enumerate() {
                                 if ui.button(em).clicked() {
                                     info!("ui: picker chose '{}' for note {:?}", em, note.id());
+                                    notedeck::platform::android::android_log_d("ui", &format!("picker chose '{}' for note {:?}", em, note.id()));
                                     // capture selection only; apply action after the UI closure to avoid nested borrows
                                     picker_chosen = Some(i as i32);
                                 }
@@ -1110,6 +1118,7 @@ fn actionbar_ui(
                     if let Some(idx_usize) = Some(idx as usize).filter(|&i| i < reactions.len()) {
                         let chosen = reactions[idx_usize];
                         info!("ui: send reaction '{}' for note {:?}", chosen, note.id());
+                        notedeck::platform::android::android_log_d("ui", &format!("send reaction '{}' for note {:?}", chosen, note.id()));
                         action = Some(NoteAction::React(ReactAction::new(
                             NoteId::new(*note.id()),
                             chosen,

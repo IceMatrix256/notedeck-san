@@ -258,6 +258,14 @@ impl Accounts {
             &self.cache.selected().data,
             create_wakeup(ctx),
         );
+
+        // Ensure initial filters are sent for the newly selected account to all connected relays.
+        // This is important when relays were already open before switching accounts so that
+        // account-specific subscriptions (contacts, muted, relay list) are established.
+        let relay_urls: Vec<String> = pool.relays.iter().map(|r| r.url().to_string()).collect();
+        for relay_url in relay_urls {
+            self.send_initial_filters(pool, &relay_url);
+        }
     }
 
     pub fn mutefun(&self) -> Box<MuteFun> {
