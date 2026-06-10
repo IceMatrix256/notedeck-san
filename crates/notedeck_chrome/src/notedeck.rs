@@ -9,7 +9,7 @@ use re_memory::AccountingAllocator;
 static GLOBAL: AccountingAllocator<std::alloc::System> =
     AccountingAllocator::new(std::alloc::System);
 
-use notedeck::{DataPath, DataPathType, Notedeck};
+use notedeck::{Args, DataPath, DataPathType, Notedeck, NotedeckOptions};
 use notedeck_chrome::{setup::generate_native_options, Chrome};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
@@ -67,6 +67,13 @@ fn setup_logging(path: &DataPath) -> Option<WorkerGuard> {
     maybe_guard
 }
 
+fn resolve_native_title(args_raw: &[String]) -> (String, bool) {
+    let (args, _) = Args::parse(args_raw);
+    let show_title = args.options.contains(NotedeckOptions::ShowTitle);
+    let title = args.title.unwrap_or_else(|| "Damus Notedeck".to_string());
+    (title, show_title)
+}
+
 // Desktop
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::main]
@@ -80,14 +87,19 @@ async fn main() {
     // This guard must be scoped for the duration of the entire program so all logs will be written
     let _guard = setup_logging(&path);
 
+    // Pre-scan for --title so we can set the window title and show the
+    // titlebar before eframe creates the window.
+    let args_raw: Vec<String> = std::env::args().collect();
+    let (title, show_title) = resolve_native_title(&args_raw);
+
     let _res = eframe::run_native(
-        "Damus Notedeck",
-        generate_native_options(path),
+        &title,
+        generate_native_options(path, show_title),
         Box::new(|cc| {
             let args: Vec<String> = std::env::args().collect();
             let ctx = &cc.egui_ctx;
 
-            let mut notedeck = Notedeck::new(ctx, base_path, &args);
+            let mut notedeck = Notedeck::init(ctx, base_path, &args);
             notedeck.setup(ctx);
             let chrome = Chrome::new_with_apps(cc, &args, &mut notedeck)?;
             notedeck.set_app(chrome);
@@ -123,9 +135,11 @@ pub fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::Notedeck;
+    use super::{resolve_native_title, Notedeck};
+    use notedeck::{Args, DataPath, NotedeckOptions};
     use notedeck_columns::Damus;
     use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
 
     fn create_tmp_dir() -> PathBuf {
         tempfile::TempDir::new()
@@ -138,12 +152,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    fn apply_window_builder_for_args(args: &[String]) -> (String, bool, egui::ViewportBuilder) {
+        let (title, show_title) = resolve_native_title(args);
+        let tempdir = TempDir::new().expect("tmp path");
+        let options = notedeck_chrome::setup::generate_native_options(
+            DataPath::new(tempdir.path()),
+            show_title,
+        );
+        let builder = (options.window_builder.expect("window builder should exist"))(
+            egui::ViewportBuilder::default(),
+        );
+        (title, show_title, builder)
+    }
+
     /// Ensure dbpath actually sets the dbpath correctly.
     #[tokio::test]
     async fn test_dbpath() {
         let datapath = create_tmp_dir();
         let dbpath = create_tmp_dir();
         let args: Vec<String> = [
+            "notedeck-test",
             "--testrunner",
             "--datapath",
             &datapath.to_str().unwrap(),
@@ -155,7 +183,7 @@ mod tests {
         .collect();
 
         let ctx = egui::Context::default();
-        let _app = Notedeck::new(&ctx, &datapath, &args);
+        let _app = Notedeck::init(&ctx, &datapath, &args);
 
         assert!(Path::new(&dbpath.join("data.mdb")).exists());
         assert!(Path::new(&dbpath.join("lock.mdb")).exists());
@@ -170,6 +198,7 @@ mod tests {
         let tmpdir = create_tmp_dir();
         let npub = "npub1xtscya34g58tk0z605fvr788k263gsu6cy9x0mhnm87echrgufzsevkk5s";
         let args: Vec<String> = [
+            "notedeck-test",
             "--testrunner",
             "--no-keystore",
             "--pub",
@@ -184,8 +213,8 @@ mod tests {
         .collect();
 
         let ctx = egui::Context::default();
-        let mut notedeck = Notedeck::new(&ctx, &tmpdir, &args);
-        let mut app_ctx = notedeck.app_context();
+        let mut notedeck = Notedeck::init(&ctx, &tmpdir, &args);
+        let mut app_ctx = notedeck.app_context(&ctx);
         let app = Damus::new(&mut app_ctx, &args);
 
         assert_eq!(app.columns(app_ctx.accounts).columns().len(), 2);
@@ -218,6 +247,7 @@ mod tests {
         let tmpdir = create_tmp_dir();
         let npub = "npub1xtscya34g58tk0z605fvr788k263gsu6cy9x0mhnm87echrgufzsevkk5s";
         let args: Vec<String> = [
+            "notedeck-test",
             "--testrunner",
             "--no-keystore",
             "--unknown-arg", // <-- UNKNOWN
@@ -233,9 +263,8 @@ mod tests {
         .collect();
 
         let ctx = egui::Context::default();
-        let mut notedeck = Notedeck::new(&ctx, &tmpdir, &args);
-        let mut app_ctx = notedeck.app_context();
-        let app = Damus::new(&mut app_ctx, &args);
+        let mut notedeck = Notedeck::init(&ctx, &tmpdir, &args);
+        let app = Damus::new(&mut notedeck.app_context(&ctx), &args);
 
         // ensure we recognized all the arguments
         let completely_unrecognized: Vec<String> = notedeck
@@ -246,5 +275,57 @@ mod tests {
         assert_eq!(completely_unrecognized, ["--unknown-arg"]);
 
         rmrf(tmpdir);
+    }
+
+    #[test]
+    fn title_flag_startup_path_matches_args_parse_and_shows_native_titlebar() {
+        let args = vec![
+            "notedeck".to_string(),
+            "--title".to_string(),
+            "first".to_string(),
+            "--title".to_string(),
+            "second".to_string(),
+        ];
+
+        let (parsed, unrecognized) = Args::parse(&args[1..]);
+        assert!(unrecognized.is_empty());
+
+        let (title, show_title, builder) = apply_window_builder_for_args(&args);
+
+        assert_eq!(title, parsed.title.unwrap());
+        assert_eq!(
+            show_title,
+            parsed.options.contains(NotedeckOptions::ShowTitle)
+        );
+        assert_eq!(builder.fullsize_content_view, None);
+        assert_eq!(builder.titlebar_shown, None);
+        assert_eq!(builder.title_shown, None);
+    }
+
+    #[test]
+    fn missing_or_absent_title_hides_native_titlebar() {
+        let cases = [
+            vec!["notedeck".to_string()],
+            vec!["notedeck".to_string(), "--title".to_string()],
+        ];
+
+        for args in cases {
+            let (parsed, unrecognized) = Args::parse(&args[1..]);
+            assert!(unrecognized.is_empty());
+
+            let (title, show_title, builder) = apply_window_builder_for_args(&args);
+
+            assert_eq!(
+                title,
+                parsed.title.unwrap_or_else(|| "Damus Notedeck".to_string())
+            );
+            assert_eq!(
+                show_title,
+                parsed.options.contains(NotedeckOptions::ShowTitle)
+            );
+            assert_eq!(builder.fullsize_content_view, Some(true));
+            assert_eq!(builder.titlebar_shown, Some(false));
+            assert_eq!(builder.title_shown, Some(false));
+        }
     }
 }

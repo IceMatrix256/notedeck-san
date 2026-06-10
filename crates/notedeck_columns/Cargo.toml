@@ -16,7 +16,6 @@ ndk-context = "0.1"
 
 [dependencies]
 opener = { workspace = true }
-rmpv = { workspace = true }
 bech32 = { workspace = true }
 notedeck = { workspace = true }
 tokenator = { workspace = true }
@@ -59,13 +58,22 @@ profiling = { workspace = true }
 hashbrown = { workspace = true }
 oot_bitset = { workspace = true }
 human_format = "1.1.0"
+crossbeam-channel = { workspace = true }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 rfd = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+egui_kittest = { workspace = true, features = ["eframe"] }
+eframe = { workspace = true }
+nostr = { workspace = true }
+nostr-relay-builder = "0.37"
+notedeck_testing = { workspace = true }
 pretty_assertions = { workspace = true }
+serial_test = "3"
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "2.11.0"
@@ -74,4 +82,3 @@ security-framework = "2.11.0"
 default = []
 puffin = ["dep:puffin", "profiling/profile-with-puffin"]
 tracy = ["profiling/profile-with-tracy"]
-

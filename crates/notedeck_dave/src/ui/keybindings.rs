@@ -12,6 +12,10 @@ pub enum KeyAction {
     TentativeAccept,
     /// Tentatively deny, waiting for message (Shift+2)
     TentativeDeny,
+    /// Allow always — add to session allowlist and accept (3)
+    AllowAlways,
+    /// Tentatively allow always, waiting for message (Shift+3)
+    TentativeAllowAlways,
     /// Cancel tentative state (Escape when tentative)
     CancelTentative,
     /// Switch to agent by number (0-indexed)
@@ -26,8 +30,8 @@ pub enum KeyAction {
     Interrupt,
     /// Toggle between scene view and classic view
     ToggleView,
-    /// Toggle plan mode for the active session (Ctrl+M)
-    TogglePlanMode,
+    /// Cycle permission mode: Default → Plan → AcceptEdits (Ctrl+M)
+    CyclePermissionMode,
     /// Delete the active session
     DeleteActiveSession,
     /// Navigate to next item in focus queue (Ctrl+N)
@@ -40,8 +44,14 @@ pub enum KeyAction {
     ToggleAutoSteal,
     /// Open external editor for composing input (Ctrl+G)
     OpenExternalEditor,
+    /// Open a new terminal window (Ctrl+`)
+    OpenTerminal,
     /// Clone the active agent with the same working directory (Ctrl+Shift+T)
     CloneAgent,
+    /// Clear the active agent (Ctrl+Shift+C)
+    ClearAgent,
+    /// Rename the active agent (Ctrl+Shift+R)
+    RenameAgent,
 }
 
 /// Check for keybinding actions.
@@ -58,12 +68,15 @@ pub fn check_keybindings(
     let is_agentic = ai_mode == AiMode::Agentic;
 
     // Escape in tentative state cancels the tentative mode (agentic only)
-    if is_agentic && in_tentative_state && ctx.input(|i| i.key_pressed(Key::Escape)) {
+    if is_agentic
+        && in_tentative_state
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape))
+    {
         return Some(KeyAction::CancelTentative);
     }
 
     // Escape otherwise works to interrupt AI (even when text input has focus)
-    if ctx.input(|i| i.key_pressed(Key::Escape)) {
+    if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape)) {
         return Some(KeyAction::Interrupt);
     }
 
@@ -104,6 +117,16 @@ pub fn check_keybindings(
         return Some(KeyAction::CloneAgent);
     }
 
+    // Ctrl+Shift+K to clear the active agent - agentic only
+    if is_agentic && ctx.input(|i| i.modifiers.matches_exact(ctrl_shift) && i.key_pressed(Key::K)) {
+        return Some(KeyAction::ClearAgent);
+    }
+
+    // Ctrl+Shift+R to rename the active agent
+    if ctx.input(|i| i.modifiers.matches_exact(ctrl_shift) && i.key_pressed(Key::R)) {
+        return Some(KeyAction::RenameAgent);
+    }
+
     // Ctrl+T to spawn a new agent/chat
     if ctx.input(|i| i.modifiers.matches_exact(ctrl) && i.key_pressed(Key::T)) {
         return Some(KeyAction::NewAgent);
@@ -119,9 +142,14 @@ pub fn check_keybindings(
         return Some(KeyAction::OpenExternalEditor);
     }
 
-    // Ctrl+M to toggle plan mode - agentic only
+    // Ctrl+` to open a new terminal window
+    if ctx.input(|i| i.modifiers.matches_exact(ctrl) && i.key_pressed(Key::Backtick)) {
+        return Some(KeyAction::OpenTerminal);
+    }
+
+    // Ctrl+M to cycle permission mode - agentic only
     if is_agentic && ctx.input(|i| i.modifiers.matches_exact(ctrl) && i.key_pressed(Key::M)) {
-        return Some(KeyAction::TogglePlanMode);
+        return Some(KeyAction::CyclePermissionMode);
     }
 
     // Ctrl+D to toggle Done status for current focus queue item - agentic only
@@ -193,18 +221,24 @@ pub fn check_keybindings(
             if i.modifiers.shift && i.key_pressed(Key::Num2) {
                 return Some(KeyAction::TentativeDeny);
             }
+            // Shift+3: tentative allow always
+            if i.modifiers.shift && i.key_pressed(Key::Num3) {
+                return Some(KeyAction::TentativeAllowAlways);
+            }
             None
         }) {
             return Some(action);
         }
 
-        // Bare keypresses (no modifiers) for immediate accept/deny
+        // Bare keypresses (no modifiers) for immediate accept/deny/always
         if let Some(action) = ctx.input(|i| {
             if !i.modifiers.any() {
                 if i.key_pressed(Key::Num1) {
                     return Some(KeyAction::AcceptPermission);
                 } else if i.key_pressed(Key::Num2) {
                     return Some(KeyAction::DenyPermission);
+                } else if i.key_pressed(Key::Num3) {
+                    return Some(KeyAction::AllowAlways);
                 }
             }
             None

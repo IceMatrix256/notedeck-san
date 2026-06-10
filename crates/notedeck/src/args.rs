@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
-use crate::NotedeckOptions;
+use crate::{DataPath, DataPathType, NotedeckOptions};
 use enostr::{Keypair, Pubkey, SecretKey};
 use tracing::error;
 use unic_langid::{LanguageIdentifier, LanguageIdentifierError};
@@ -12,9 +13,23 @@ pub struct Args {
     pub options: NotedeckOptions,
     pub dbpath: Option<String>,
     pub datapath: Option<String>,
+    pub title: Option<String>,
 }
 
 impl Args {
+    /// Resolve the effective database path, respecting --dbpath override.
+    pub fn db_path(&self, data_path: &DataPath) -> PathBuf {
+        self.dbpath
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_path.path(DataPathType::Db))
+    }
+
+    /// Resolve the compact output path inside the db folder.
+    pub fn db_compact_path(&self, data_path: &DataPath) -> PathBuf {
+        self.db_path(data_path).join("compact")
+    }
+
     // parse arguments, return set of unrecognized args
     pub fn parse(args: &[String]) -> (Self, BTreeSet<String>) {
         let mut unrecognized_args = BTreeSet::new();
@@ -25,6 +40,7 @@ impl Args {
             dbpath: None,
             datapath: None,
             locale: None,
+            title: None,
         };
 
         let mut i = 0;
@@ -59,6 +75,7 @@ impl Args {
                 res.options.set(NotedeckOptions::Debug, true);
             } else if arg == "--testrunner" {
                 res.options.set(NotedeckOptions::Tests, true);
+                res.options.set(NotedeckOptions::UseKeystore, false);
             } else if arg == "--pub" || arg == "--npub" {
                 i += 1;
                 let pubstr = if let Some(next_arg) = args.get(i) {
@@ -121,9 +138,17 @@ impl Args {
                 };
                 res.relays.push(relay.clone());
             } else if arg == "--no-keystore" {
-                res.options.set(NotedeckOptions::UseKeystore, true);
-            } else if arg == "--relay-debug" {
-                res.options.set(NotedeckOptions::RelayDebug, true);
+                res.options.set(NotedeckOptions::UseKeystore, false);
+            } else if arg == "--title" {
+                i += 1;
+                let title = if let Some(next_arg) = args.get(i) {
+                    next_arg
+                } else {
+                    error!("title argument missing?");
+                    continue;
+                };
+                res.title = Some(title.clone());
+                res.options.set(NotedeckOptions::ShowTitle, true);
             } else {
                 unrecognized_args.insert(arg.clone());
             }
@@ -132,5 +157,65 @@ impl Args {
         }
 
         (res, unrecognized_args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_args(args: &[&str]) -> Args {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        let (parsed, unrecognized) = Args::parse(&owned);
+        assert!(
+            unrecognized.is_empty(),
+            "expected all args to be recognized, got {unrecognized:?}"
+        );
+        parsed
+    }
+
+    #[test]
+    fn parse_title_variants() {
+        let cases = [
+            (
+                vec!["--title", "feature branch"],
+                Some("feature branch"),
+                true,
+            ),
+            (
+                vec!["--title", "first", "--title", "second"],
+                Some("second"),
+                true,
+            ),
+            (vec!["--title"], None, false),
+        ];
+
+        for (args, expected_title, expected_show_title) in cases {
+            let parsed = parse_args(&args);
+            assert_eq!(parsed.title.as_deref(), expected_title);
+            assert_eq!(
+                parsed.options.contains(NotedeckOptions::ShowTitle),
+                expected_show_title
+            );
+        }
+    }
+
+    /// Verifies `--no-keystore` disables OS-backed secure storage.
+    #[test]
+    fn parse_no_keystore_disables_keystore() {
+        let (args, unrecognized) = Args::parse(&["--no-keystore".to_owned()]);
+
+        assert!(unrecognized.is_empty());
+        assert!(!args.options.contains(NotedeckOptions::UseKeystore));
+    }
+
+    /// Verifies the test runner path never touches the host keyring.
+    #[test]
+    fn parse_testrunner_disables_keystore() {
+        let (args, unrecognized) = Args::parse(&["--testrunner".to_owned()]);
+
+        assert!(unrecognized.is_empty());
+        assert!(args.options.contains(NotedeckOptions::Tests));
+        assert!(!args.options.contains(NotedeckOptions::UseKeystore));
     }
 }

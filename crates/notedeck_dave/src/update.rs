@@ -3,12 +3,12 @@
 //! These are standalone functions with explicit inputs to reduce the complexity
 //! of the main Dave struct and make the code more testable and reusable.
 
-use crate::backend::AiBackend;
+use crate::backend::{AiBackend, BackendType, Model};
 use crate::config::AiMode;
 use crate::focus_queue::{FocusPriority, FocusQueue};
 use crate::messages::{
-    AnswerSummary, AnswerSummaryEntry, AskUserQuestionInput, Message, PermissionResponse,
-    QuestionAnswer,
+    AnswerSummary, AnswerSummaryEntry, Message, PermissionRequest, PermissionResponse,
+    PermissionView, QuestionAnswer,
 };
 use crate::session::{ChatSession, EditorJob, PermissionMessageState, SessionId, SessionManager};
 use crate::ui::{AgentScene, DirectoryPicker};
@@ -78,6 +78,20 @@ pub fn execute_interrupt(
     }
 }
 
+/// Exit a tool call by denying it and cancelling the current turn.
+pub fn exit_tool_call(
+    session_manager: &mut SessionManager,
+    request_id: uuid::Uuid,
+) -> Option<PermissionPublish> {
+    handle_permission_response(
+        session_manager,
+        request_id,
+        PermissionResponse::Cancel {
+            reason: "User exited tool call".into(),
+        },
+    )
+}
+
 /// Check if interrupt confirmation has timed out.
 /// Returns None if timed out, otherwise returns the original value.
 pub fn check_interrupt_timeout(pending_since: Option<Instant>) -> Option<Instant> {
@@ -90,30 +104,78 @@ pub fn check_interrupt_timeout(pending_since: Option<Instant>) -> Option<Instant
 // Plan Mode
 // =============================================================================
 
-/// Toggle plan mode for the active session.
-pub fn toggle_plan_mode(
+/// Add the current pending permission's tool to the session's runtime allowlist.
+/// Returns the key that was added (for logging), or None if no pending permission.
+pub fn allow_always(session_manager: &mut SessionManager) -> Option<String> {
+    let session = session_manager.get_active_mut()?;
+    let agentic = session.agentic.as_mut()?;
+
+    // Find the last pending (unresponded) permission request
+    let (tool_name, tool_input) = session.chat.iter().rev().find_map(|msg| {
+        if let crate::messages::Message::PermissionRequest(req) = msg {
+            if req.response.is_none() {
+                return Some((req.tool_name.clone(), req.tool_input.clone()));
+            }
+        }
+        None
+    })?;
+
+    let key = agentic.add_runtime_allow(&tool_name, &tool_input);
+    if let Some(ref k) = key {
+        tracing::info!("allow_always: added runtime allow for '{}'", k);
+    }
+    key
+}
+
+/// Cycle permission mode for the active session: Default → Plan → AcceptEdits → Default.
+/// Info needed to publish a permission mode command to a remote host.
+pub struct ModeCommandPublish {
+    pub session_id: String,
+    pub mode: &'static str,
+}
+
+pub fn cycle_permission_mode(
     session_manager: &mut SessionManager,
     backend: &dyn AiBackend,
     ctx: &egui::Context,
-) {
-    if let Some(session) = session_manager.get_active_mut() {
-        if let Some(agentic) = &mut session.agentic {
-            let new_mode = match agentic.permission_mode {
-                PermissionMode::Plan => PermissionMode::Default,
-                _ => PermissionMode::Plan,
-            };
-            agentic.permission_mode = new_mode;
+) -> Option<ModeCommandPublish> {
+    let session = session_manager.get_active_mut()?;
+    let is_remote = session.is_remote();
+    let session_id = session.id;
+    let agentic = session.agentic.as_mut()?;
 
-            let session_id = format!("dave-session-{}", session.id);
-            backend.set_permission_mode(session_id, new_mode, ctx.clone());
+    let new_mode = match agentic.permission_mode {
+        PermissionMode::Default => PermissionMode::Plan,
+        PermissionMode::Plan => PermissionMode::AcceptEdits,
+        _ => PermissionMode::Default,
+    };
+    agentic.permission_mode = new_mode;
 
-            tracing::debug!(
-                "Toggled plan mode for session {} to {:?}",
-                session.id,
-                new_mode
-            );
-        }
-    }
+    let mode_str = crate::session::permission_mode_to_str(new_mode);
+
+    let result = if is_remote {
+        // Remote session: return info for caller to publish command event
+        let event_sid = agentic.event_session_id().to_string();
+        Some(ModeCommandPublish {
+            session_id: event_sid,
+            mode: mode_str,
+        })
+    } else {
+        // Local session: apply directly and mark dirty for state event publish
+        let backend_sid = format!("dave-session-{}", session_id);
+        backend.set_permission_mode(backend_sid, new_mode, ctx.clone());
+        session.state_dirty = true;
+        None
+    };
+
+    tracing::debug!(
+        "Cycled permission mode for session {} to {:?} (remote={})",
+        session_id,
+        new_mode,
+        is_remote,
+    );
+
+    result
 }
 
 /// Exit plan mode for the active session (switch to Default mode).
@@ -136,20 +198,33 @@ pub fn exit_plan_mode(
 // Permission Handling
 // =============================================================================
 
+fn first_remote_pending_permission(
+    session: &ChatSession,
+) -> Option<&crate::messages::PermissionRequest> {
+    let agentic = session.agentic.as_ref();
+    let responded = agentic.map(|a| &a.permissions.responded);
+    session.chat.iter().find_map(|msg| {
+        let Message::PermissionRequest(req) = msg else {
+            return None;
+        };
+        if req.response.is_some() {
+            return None;
+        }
+        if responded.is_some_and(|ids| ids.contains_key(&req.id)) {
+            return None;
+        }
+        if agentic.is_some_and(|a| a.should_runtime_allow(&req.tool_name, &req.tool_input)) {
+            return None;
+        }
+        Some(req)
+    })
+}
+
 /// Get the first pending permission request ID for the active session.
 pub fn first_pending_permission(session_manager: &SessionManager) -> Option<uuid::Uuid> {
     let session = session_manager.get_active()?;
     if session.is_remote() {
-        // Remote: find first unresponded PermissionRequest in chat
-        let responded = session.agentic.as_ref().map(|a| &a.permissions.responded);
-        for msg in &session.chat {
-            if let Message::PermissionRequest(req) = msg {
-                if req.response.is_none() && responded.is_none_or(|ids| !ids.contains(&req.id)) {
-                    return Some(req.id);
-                }
-            }
-        }
-        None
+        first_remote_pending_permission(session).map(|req| req.id)
     } else {
         // Local: check oneshot senders
         session
@@ -159,37 +234,44 @@ pub fn first_pending_permission(session_manager: &SessionManager) -> Option<uuid
     }
 }
 
-/// Get the tool name of the first pending permission request.
-pub fn pending_permission_tool_name(session_manager: &SessionManager) -> Option<&str> {
-    let request_id = first_pending_permission(session_manager)?;
+/// Get the first pending permission request for the active session.
+pub fn pending_permission(session_manager: &SessionManager) -> Option<&PermissionRequest> {
     let session = session_manager.get_active()?;
 
-    for msg in &session.chat {
-        if let Message::PermissionRequest(req) = msg {
-            if req.id == request_id {
-                return Some(&req.tool_name);
-            }
-        }
+    if session.is_remote() {
+        return first_remote_pending_permission(session);
     }
 
-    None
+    let request_id = first_pending_permission(session_manager)?;
+    session.chat.iter().find_map(|msg| {
+        if let Message::PermissionRequest(req) = msg {
+            if req.id == request_id {
+                return Some(req);
+            }
+        }
+        None
+    })
 }
 
-/// Check if the first pending permission is an AskUserQuestion tool call.
+/// Check if the first pending permission is a shared question-set prompt.
 pub fn has_pending_question(session_manager: &SessionManager) -> bool {
-    pending_permission_tool_name(session_manager) == Some("AskUserQuestion")
+    pending_permission(session_manager)
+        .is_some_and(|request| matches!(request.view, PermissionView::QuestionSet(_)))
 }
 
 /// Check if the first pending permission is an ExitPlanMode tool call.
 pub fn has_pending_exit_plan_mode(session_manager: &SessionManager) -> bool {
-    pending_permission_tool_name(session_manager) == Some("ExitPlanMode")
+    pending_permission(session_manager).is_some_and(|request| request.view.is_plan_review())
 }
 
-/// Data needed to publish a permission response to relays.
+/// Data needed to publish a permission response event.
 pub struct PermissionPublish {
     pub perm_id: uuid::Uuid,
+    pub event_session_id: String,
+    pub request_note_id: [u8; 32],
     pub allowed: bool,
     pub message: Option<String>,
+    pub cancel_turn: bool,
 }
 
 /// Handle a permission response (from UI button or keybinding).
@@ -201,23 +283,43 @@ pub fn handle_permission_response(
     let session = session_manager.get_active_mut()?;
 
     let is_remote = session.is_remote();
+    let cancels_turn = response.cancels_turn();
+    let publish_metadata = session.agentic.as_ref().and_then(|agentic| {
+        let request_note_id = agentic
+            .permissions
+            .request_note_ids
+            .get(&request_id)
+            .copied()?;
+        Some((agentic.event_session_id().to_string(), request_note_id))
+    });
+    if is_remote && publish_metadata.is_none() {
+        tracing::warn!(
+            "missing permission publish metadata for remote request {}",
+            request_id
+        );
+        return None;
+    }
 
     let response_type = match &response {
         PermissionResponse::Allow { .. } => crate::messages::PermissionResponseType::Allowed,
-        PermissionResponse::Deny { .. } => crate::messages::PermissionResponseType::Denied,
+        PermissionResponse::Deny { .. } | PermissionResponse::Cancel { .. } => {
+            crate::messages::PermissionResponseType::Denied
+        }
     };
 
     // Extract relay-publish info before we move `response`.
     let allowed = matches!(&response, PermissionResponse::Allow { .. });
     let message = match &response {
         PermissionResponse::Allow { message } => message.clone(),
-        PermissionResponse::Deny { reason } => Some(reason.clone()),
+        PermissionResponse::Deny { reason } | PermissionResponse::Cancel { reason } => {
+            Some(reason.clone())
+        }
     };
 
     // If Allow has a message, add it as a User message to the chat
     if let PermissionResponse::Allow { message: Some(msg) } = &response {
         if !msg.is_empty() {
-            session.chat.push(Message::User(msg.clone()));
+            session.chat.push(Message::User(msg.clone().into()));
         }
     }
 
@@ -236,16 +338,27 @@ pub fn handle_permission_response(
             is_remote,
             Some(response),
         );
+
+        // Optimistically set remote status to Working so the phone doesn't
+        // have to wait for the full round-trip (phone→relay→desktop→relay→phone)
+        // before auto-steal can move on. The desktop will publish the real
+        // status once it processes the permission response.
+        if is_remote && !cancels_turn {
+            agentic.remote_status = Some(crate::agent_status::AgentStatus::Working);
+        }
     }
 
-    Some(PermissionPublish {
+    publish_metadata.map(|(event_session_id, request_note_id)| PermissionPublish {
         perm_id: request_id,
+        event_session_id,
+        request_note_id,
         allowed,
         message,
+        cancel_turn: cancels_turn,
     })
 }
 
-/// Handle a user's response to an AskUserQuestion tool call.
+/// Handle a user's response to a shared question-set prompt.
 pub fn handle_question_response(
     session_manager: &mut SessionManager,
     request_id: uuid::Uuid,
@@ -254,12 +367,27 @@ pub fn handle_question_response(
     let session = session_manager.get_active_mut()?;
 
     let is_remote = session.is_remote();
+    let publish_metadata = session.agentic.as_ref().and_then(|agentic| {
+        let request_note_id = agentic
+            .permissions
+            .request_note_ids
+            .get(&request_id)
+            .copied()?;
+        Some((agentic.event_session_id().to_string(), request_note_id))
+    });
+    if is_remote && publish_metadata.is_none() {
+        tracing::warn!(
+            "missing question publish metadata for remote request {}",
+            request_id
+        );
+        return None;
+    }
 
-    // Find the original AskUserQuestion request to get the question labels
+    // Find the original shared question-set request to get the option labels.
     let questions_input = session.chat.iter().find_map(|msg| {
         if let Message::PermissionRequest(req) = msg {
-            if req.id == request_id && req.tool_name == "AskUserQuestion" {
-                serde_json::from_value::<AskUserQuestionInput>(req.tool_input.clone()).ok()
+            if req.id == request_id {
+                req.view.question_set()
             } else {
                 None
             }
@@ -269,7 +397,7 @@ pub fn handle_question_response(
     });
 
     // Format answers as JSON for the tool response, and build summary for display
-    let (formatted_response, answer_summary) = if let Some(ref questions) = questions_input {
+    let (formatted_response, answer_summary) = if let Some(questions) = questions_input {
         let mut answers_obj = serde_json::Map::new();
         let mut summary_entries = Vec::with_capacity(questions.questions.len());
 
@@ -353,12 +481,20 @@ pub fn handle_question_response(
             is_remote,
             Some(oneshot_response),
         );
+
+        // Optimistically set remote status to Working (same as permission response)
+        if is_remote {
+            agentic.remote_status = Some(crate::agent_status::AgentStatus::Working);
+        }
     }
 
-    Some(PermissionPublish {
+    publish_metadata.map(|(event_session_id, request_note_id)| PermissionPublish {
         perm_id: request_id,
+        event_session_id,
+        request_note_id,
         allowed: true,
         message: Some(formatted_response),
+        cancel_turn: false,
     })
 }
 
@@ -392,14 +528,15 @@ pub fn switch_and_focus_session(
     }
 }
 
-/// Switch to agent by index in the ordered list (0-indexed).
+/// Switch to agent by index in the visual display order (0-indexed).
 pub fn switch_to_agent_by_index(
     session_manager: &mut SessionManager,
+    collapse: &crate::collapse_state::CollapseState,
     scene: &mut AgentScene,
     show_scene: bool,
     index: usize,
 ) {
-    let ids = session_manager.session_ids();
+    let ids = session_manager.visual_order(collapse);
     if let Some(&id) = ids.get(index) {
         switch_and_focus_session(session_manager, scene, show_scene, id);
     }
@@ -408,11 +545,12 @@ pub fn switch_to_agent_by_index(
 /// Cycle agents using a direction function that computes the next index.
 fn cycle_agent(
     session_manager: &mut SessionManager,
+    collapse: &crate::collapse_state::CollapseState,
     scene: &mut AgentScene,
     show_scene: bool,
     index_fn: impl FnOnce(usize, usize) -> usize,
 ) {
-    let ids = session_manager.session_ids();
+    let ids = session_manager.visual_order(collapse);
     if ids.is_empty() {
         return;
     }
@@ -429,10 +567,11 @@ fn cycle_agent(
 /// Cycle to the next agent.
 pub fn cycle_next_agent(
     session_manager: &mut SessionManager,
+    collapse: &crate::collapse_state::CollapseState,
     scene: &mut AgentScene,
     show_scene: bool,
 ) {
-    cycle_agent(session_manager, scene, show_scene, |idx, len| {
+    cycle_agent(session_manager, collapse, scene, show_scene, |idx, len| {
         (idx + 1) % len
     });
 }
@@ -440,10 +579,11 @@ pub fn cycle_next_agent(
 /// Cycle to the previous agent.
 pub fn cycle_prev_agent(
     session_manager: &mut SessionManager,
+    collapse: &crate::collapse_state::CollapseState,
     scene: &mut AgentScene,
     show_scene: bool,
 ) {
-    cycle_agent(session_manager, scene, show_scene, |idx, len| {
+    cycle_agent(session_manager, collapse, scene, show_scene, |idx, len| {
         if idx == 0 {
             len - 1
         } else {
@@ -456,27 +596,80 @@ pub fn cycle_prev_agent(
 // Focus Queue Operations
 // =============================================================================
 
-/// Navigate to the next item in the focus queue.
+/// Navigate to the next visible item in the focus queue.
+/// Skips sessions inside collapsed folders.
+/// Done items are automatically dismissed after switching to them.
 pub fn focus_queue_next(
     session_manager: &mut SessionManager,
     focus_queue: &mut FocusQueue,
+    collapse: &crate::collapse_state::CollapseState,
     scene: &mut AgentScene,
     show_scene: bool,
 ) {
-    if let Some(session_id) = focus_queue.next() {
-        switch_and_focus_session(session_manager, scene, show_scene, session_id);
+    let visible = session_manager.visual_order(collapse);
+    let saved_cursor = focus_queue.cursor_index();
+    let max_attempts = focus_queue.len();
+    for _ in 0..max_attempts {
+        if let Some(session_id) = focus_queue.next() {
+            if visible.contains(&session_id) {
+                switch_and_focus_session(session_manager, scene, show_scene, session_id);
+                dismiss_done(session_manager, focus_queue, session_id);
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+    // All skipped — restore cursor to original position.
+    if let Some(idx) = saved_cursor {
+        focus_queue.set_cursor(idx);
     }
 }
 
-/// Navigate to the previous item in the focus queue.
+/// Navigate to the previous visible item in the focus queue.
+/// Skips sessions inside collapsed folders.
+/// Done items are automatically dismissed after switching to them.
 pub fn focus_queue_prev(
     session_manager: &mut SessionManager,
     focus_queue: &mut FocusQueue,
+    collapse: &crate::collapse_state::CollapseState,
     scene: &mut AgentScene,
     show_scene: bool,
 ) {
-    if let Some(session_id) = focus_queue.prev() {
-        switch_and_focus_session(session_manager, scene, show_scene, session_id);
+    let visible = session_manager.visual_order(collapse);
+    let saved_cursor = focus_queue.cursor_index();
+    let max_attempts = focus_queue.len();
+    for _ in 0..max_attempts {
+        if let Some(session_id) = focus_queue.prev() {
+            if visible.contains(&session_id) {
+                switch_and_focus_session(session_manager, scene, show_scene, session_id);
+                dismiss_done(session_manager, focus_queue, session_id);
+                return;
+            }
+        } else {
+            return;
+        }
+    }
+    // All skipped — restore cursor to original position.
+    if let Some(idx) = saved_cursor {
+        focus_queue.set_cursor(idx);
+    }
+}
+
+/// Dismiss a Done session from the focus queue and clear its indicator.
+fn dismiss_done(
+    session_manager: &mut SessionManager,
+    focus_queue: &mut FocusQueue,
+    session_id: SessionId,
+) {
+    if focus_queue.get_session_priority(session_id) == Some(FocusPriority::Done) {
+        focus_queue.dequeue_done(session_id);
+        if let Some(session) = session_manager.get_mut(session_id) {
+            if session.indicator == Some(FocusPriority::Done) {
+                session.indicator = None;
+                session.state_dirty = true;
+            }
+        }
     }
 }
 
@@ -523,9 +716,13 @@ pub fn toggle_auto_steal(
 /// Process auto-steal focus logic: switch to focus queue items as needed.
 /// Returns true if focus was stolen (switched to a NeedsInput or Done session),
 /// which can be used to raise the OS window.
+///
+/// Sessions inside collapsed directories are skipped — auto-steal only
+/// targets sessions the user can currently see.
 pub fn process_auto_steal_focus(
     session_manager: &mut SessionManager,
     focus_queue: &mut FocusQueue,
+    collapse: &crate::collapse_state::CollapseState,
     scene: &mut AgentScene,
     show_scene: bool,
     auto_steal_focus: bool,
@@ -535,11 +732,14 @@ pub fn process_auto_steal_focus(
         return false;
     }
 
-    let has_needs_input = focus_queue.has_needs_input();
-    let has_done = focus_queue.has_done();
+    let visible = session_manager.visual_order(collapse);
 
-    if has_needs_input {
-        // There are NeedsInput items - check if we need to steal focus
+    let first_visible_needs_input =
+        focus_queue.first_visible_index(FocusPriority::NeedsInput, &visible);
+    let first_visible_done = focus_queue.first_visible_index(FocusPriority::Done, &visible);
+
+    if let Some(idx) = first_visible_needs_input {
+        // There are visible NeedsInput items - check if we need to steal focus
         let current_session = session_manager.active_id();
         let current_priority = current_session.and_then(|id| focus_queue.get_session_priority(id));
         let already_on_needs_input = current_priority == Some(FocusPriority::NeedsInput);
@@ -551,18 +751,15 @@ pub fn process_auto_steal_focus(
                 tracing::debug!("Auto-steal: saved home session {:?}", home_session);
             }
 
-            // Jump to first NeedsInput item
-            if let Some(idx) = focus_queue.first_needs_input_index() {
-                focus_queue.set_cursor(idx);
-                if let Some(entry) = focus_queue.current() {
-                    switch_and_focus_session(session_manager, scene, show_scene, entry.session_id);
-                    tracing::debug!("Auto-steal: switched to session {:?}", entry.session_id);
-                    return true;
-                }
+            focus_queue.set_cursor(idx);
+            if let Some(entry) = focus_queue.current() {
+                switch_and_focus_session(session_manager, scene, show_scene, entry.session_id);
+                tracing::debug!("Auto-steal: switched to session {:?}", entry.session_id);
+                return true;
             }
         }
-    } else if has_done {
-        // No NeedsInput but there are Done items - auto-focus those
+    } else if let Some(idx) = first_visible_done {
+        // No visible NeedsInput but there are visible Done items - auto-focus those
         let current_session = session_manager.active_id();
         let current_priority = current_session.and_then(|id| focus_queue.get_session_priority(id));
         let already_on_done = current_priority == Some(FocusPriority::Done);
@@ -574,25 +771,26 @@ pub fn process_auto_steal_focus(
                 tracing::debug!("Auto-steal: saved home session {:?}", home_session);
             }
 
-            // Jump to first Done item and clear it from the queue
-            if let Some(idx) = focus_queue.first_done_index() {
-                focus_queue.set_cursor(idx);
-                if let Some(entry) = focus_queue.current() {
-                    let sid = entry.session_id;
-                    switch_and_focus_session(session_manager, scene, show_scene, sid);
-                    focus_queue.dequeue(sid);
-                    tracing::debug!(
-                        "Auto-steal: switched to Done session {:?} and cleared indicator",
-                        sid
-                    );
-                    return true;
-                }
+            focus_queue.set_cursor(idx);
+            if let Some(entry) = focus_queue.current() {
+                let sid = entry.session_id;
+                switch_and_focus_session(session_manager, scene, show_scene, sid);
+                tracing::debug!("Auto-steal: switched to Done session {:?}", sid);
+                return true;
             }
         }
     } else if let Some(home_id) = home_session.take() {
-        // No more NeedsInput or Done items - return to saved session
-        switch_and_focus_session(session_manager, scene, show_scene, home_id);
-        tracing::debug!("Auto-steal: returned to home session {:?}", home_id);
+        // No more visible NeedsInput or Done items - return to saved session
+        // only if it is still visible (not inside a collapsed group).
+        if visible.contains(&home_id) {
+            switch_and_focus_session(session_manager, scene, show_scene, home_id);
+            tracing::debug!("Auto-steal: returned to home session {:?}", home_id);
+        } else {
+            tracing::debug!(
+                "Auto-steal: home session {:?} is collapsed, staying on current",
+                home_id
+            );
+        }
     }
 
     false
@@ -659,6 +857,8 @@ pub fn open_external_editor(session_manager: &mut SessionManager) {
         Err(e) => {
             tracing::error!("Failed to spawn external editor: {}", e);
             let _ = std::fs::remove_file(&temp_path);
+            let _ = std::fs::remove_file(temp_path.with_extension("sh"));
+            let _ = std::fs::remove_file(temp_path.with_extension("done"));
         }
     }
 }
@@ -752,18 +952,48 @@ fn find_macos_bin(bin_name: &str, app_name: &str) -> String {
 }
 
 /// Linux: spawn a terminal emulator with the editor.
+///
+/// Many Linux terminals (gnome-terminal, konsole, etc.) daemonize: the
+/// spawned process exits immediately while the actual window runs as a
+/// child of a separate daemon. This means we cannot rely on the child
+/// process exit to know when the user is done editing.
+///
+/// Instead we wrap the editor invocation in a small shell script that
+/// creates a sentinel `.done` file when the editor exits.
+/// `poll_editor_job` watches for that file.
 fn spawn_linux_editor(
     editor: &str,
     file: &std::path::Path,
 ) -> std::io::Result<std::process::Child> {
     use std::process::Command;
 
+    // Write a helper script that runs the editor then creates a sentinel.
+    let script_path = file.with_extension("sh");
+    let done_path = file.with_extension("done");
+    // Remove stale sentinel from a previous run, if any.
+    let _ = std::fs::remove_file(&done_path);
+    std::fs::write(
+        &script_path,
+        format!("#!/bin/sh\n\"$@\"\ntouch '{}'\n", done_path.display()),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    let spawn_via = |name: &str, prefix_args: &[&str]| -> std::io::Result<std::process::Child> {
+        tracing::debug!("Opening editor via {}: {} {}", name, editor, file.display());
+        let mut cmd = Command::new(name);
+        for arg in prefix_args {
+            cmd.arg(arg);
+        }
+        cmd.arg(&script_path).arg(editor).arg(file);
+        cmd.spawn()
+    };
+
     if let Ok(terminal) = std::env::var("TERMINAL") {
-        return Command::new(&terminal)
-            .arg("-e")
-            .arg(editor)
-            .arg(file)
-            .spawn();
+        return spawn_via(&terminal, &["-e"]);
     }
 
     // Auto-detect. Each terminal has different exec syntax.
@@ -773,6 +1003,7 @@ fn spawn_linux_editor(
         ("kitty", &[]),
         ("gnome-terminal", &["--"]),
         ("konsole", &["-e"]),
+        ("foot", &[]),
         ("urxvtc", &["-e"]),
         ("urxvt", &["-e"]),
         ("xterm", &["-e"]),
@@ -786,77 +1017,164 @@ fn spawn_linux_editor(
             .unwrap_or(false);
 
         if found {
-            tracing::debug!("Opening editor via {}: {} {}", name, editor, file.display());
-            let mut cmd = Command::new(name);
-            for arg in *prefix_args {
-                cmd.arg(arg);
-            }
-            cmd.arg(editor).arg(file);
-            return cmd.spawn();
+            return spawn_via(name, prefix_args);
         }
     }
 
+    // Clean up the script on failure.
+    let _ = std::fs::remove_file(&script_path);
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         "No terminal emulator found. Set $TERMINAL or $VISUAL.",
     ))
 }
 
+/// Open a new terminal window.
+///
+/// Uses `$TERMINAL` if set, otherwise falls back to the platform default
+/// (Terminal.app on macOS, `x-terminal-emulator` on Linux).
+pub fn open_terminal(cwd: &std::path::Path) {
+    let terminal = std::env::var("TERMINAL").ok();
+    let _ = open_terminal_with_terminal(cwd, terminal.as_deref());
+}
+
+/// Open a new terminal window, optionally overriding the terminal executable.
+///
+/// Returns `true` if a terminal process was successfully started.
+fn open_terminal_with_terminal(cwd: &std::path::Path, terminal: Option<&str>) -> bool {
+    use std::process::{Command, Stdio};
+
+    if let Some(terminal) = terminal {
+        match Command::new(terminal)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return true;
+            }
+            Err(e) => tracing::warn!("$TERMINAL='{}' failed: {}", terminal, e),
+        }
+    }
+
+    let result = if cfg!(target_os = "macos") {
+        Command::new("open")
+            .arg("-a")
+            .arg("Terminal")
+            .arg(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    } else if cfg!(target_os = "linux") {
+        Command::new("x-terminal-emulator")
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    } else {
+        tracing::warn!("Open terminal not supported on this platform. Set $TERMINAL.");
+        return false;
+    };
+
+    match result {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            tracing::debug!("Opened new terminal window in {:?}", cwd);
+            true
+        }
+        Err(e) => {
+            tracing::error!("Failed to open terminal: {}. Set $TERMINAL.", e);
+            false
+        }
+    }
+}
+
 /// Poll for external editor completion (called each frame).
+///
+/// On Linux, many terminals daemonize so the child process exits before
+/// the editor is done. We use a sentinel `.done` file (created by the
+/// wrapper script in `spawn_linux_editor`) to detect actual completion.
+/// The child exit is still checked so we can reap the process, but we
+/// only read the temp file once the sentinel exists.
 pub fn poll_editor_job(session_manager: &mut SessionManager) {
     let Some(ref mut job) = session_manager.pending_editor else {
         return;
     };
 
-    // Non-blocking check if child has exited
-    match job.child.try_wait() {
-        Ok(Some(status)) => {
-            let session_id = job.session_id;
-            let temp_path = job.temp_path.clone();
-
-            if status.success() {
-                match std::fs::read_to_string(&temp_path) {
-                    Ok(content) => {
-                        if let Some(session) = session_manager.get_mut(session_id) {
-                            session.input = content;
-                            session.focus_requested = true;
-                            tracing::debug!(
-                                "External editor completed, updated input for session {}",
-                                session_id
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to read temp file after editing: {}", e);
-                    }
-                }
-            } else {
-                tracing::warn!("External editor exited with status: {}", status);
-            }
-
-            if let Err(e) = std::fs::remove_file(&temp_path) {
-                tracing::error!("Failed to remove temp file: {}", e);
-            }
-
-            session_manager.pending_editor = None;
-        }
-        Ok(None) => {
-            // Editor still running
-        }
+    // Reap child if it has exited (non-blocking).
+    let child_done = match job.child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
         Err(e) => {
             tracing::error!("Failed to poll editor process: {}", e);
-            let temp_path = job.temp_path.clone();
-            let _ = std::fs::remove_file(&temp_path);
-            session_manager.pending_editor = None;
+            true
+        }
+    };
+
+    // Check for sentinel file produced by the wrapper script.
+    // On Linux, spawn_linux_editor always creates a wrapper .sh script
+    // that touches a .done sentinel when the editor exits. We trust only
+    // the sentinel on Linux because many terminals daemonize (the child
+    // exits immediately even though the editor is still open).
+    // On macOS (no wrapper script), we fall back to child process exit.
+    let done_path = job.temp_path.with_extension("done");
+    let script_path = job.temp_path.with_extension("sh");
+    let uses_sentinel = script_path.exists();
+    let sentinel_exists = done_path.exists();
+
+    let editor_finished = if uses_sentinel {
+        sentinel_exists
+    } else {
+        child_done
+    };
+
+    if !editor_finished {
+        return;
+    }
+
+    let session_id = job.session_id;
+    let temp_path = job.temp_path.clone();
+    let script_path = temp_path.with_extension("sh");
+
+    match std::fs::read_to_string(&temp_path) {
+        Ok(content) => {
+            if let Some(session) = session_manager.get_mut(session_id) {
+                session.input = content;
+                session.focus_requested = true;
+                tracing::debug!(
+                    "External editor completed, updated input for session {}",
+                    session_id
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to read temp file after editing: {}", e);
         }
     }
+
+    // Clean up temp files.
+    let _ = std::fs::remove_file(&temp_path);
+    let _ = std::fs::remove_file(&done_path);
+    let _ = std::fs::remove_file(&script_path);
+
+    session_manager.pending_editor = None;
 }
 
 // =============================================================================
 // Session Management
 // =============================================================================
 
-/// Create a new session with the given cwd.
+/// Create a new session with the given cwd and optional model override.
+#[allow(clippy::too_many_arguments)]
 pub fn create_session_with_cwd(
     session_manager: &mut SessionManager,
     directory_picker: &mut DirectoryPicker,
@@ -865,12 +1183,18 @@ pub fn create_session_with_cwd(
     ai_mode: AiMode,
     cwd: PathBuf,
     hostname: &str,
+    backend_type: BackendType,
+    conversation_subscription: Option<crate::ConversationSubscriptionScope<'_>>,
+    model: Model,
 ) -> SessionId {
     directory_picker.add_recent(cwd.clone());
 
-    let id = session_manager.new_session(cwd, ai_mode);
+    let id = session_manager.new_session(cwd, ai_mode, backend_type);
     if let Some(session) = session_manager.get_mut(id) {
+        let model_id = model.to_model_id().map(str::to_string);
         session.details.hostname = hostname.to_string();
+        session.details.requested_model = model_id.clone();
+        session.details.model = model_id;
         session.focus_requested = true;
         if show_scene {
             scene.select(id);
@@ -878,7 +1202,28 @@ pub fn create_session_with_cwd(
                 scene.focus_on(agentic.scene_position);
             }
         }
+
+        // Set up ndb subscriptions so remote clients can send messages
+        // to this session (e.g. to kickstart the backend remotely).
+        if let (Some(subscription), Some(agentic)) =
+            (conversation_subscription, &mut session.agentic)
+        {
+            let event_id = agentic.event_session_id().to_string();
+            crate::setup_conversation_subscription(
+                agentic,
+                &event_id,
+                subscription.account,
+                subscription.ndb,
+            );
+            crate::setup_conversation_action_subscription(
+                agentic,
+                &event_id,
+                subscription.account,
+                subscription.ndb,
+            );
+        }
     }
+    session_manager.rebuild_cwd_groups();
     id
 }
 
@@ -894,10 +1239,12 @@ pub fn create_resumed_session_with_cwd(
     resume_session_id: String,
     title: String,
     hostname: &str,
+    backend_type: BackendType,
 ) -> SessionId {
     directory_picker.add_recent(cwd.clone());
 
-    let id = session_manager.new_resumed_session(cwd, resume_session_id, title, ai_mode);
+    let id =
+        session_manager.new_resumed_session(cwd, resume_session_id, title, ai_mode, backend_type);
     if let Some(session) = session_manager.get_mut(id) {
         session.details.hostname = hostname.to_string();
         session.focus_requested = true;
@@ -908,22 +1255,48 @@ pub fn create_resumed_session_with_cwd(
             }
         }
     }
+    session_manager.rebuild_cwd_groups();
     id
 }
 
 /// Clone the active agent, creating a new session with the same working directory.
-pub fn clone_active_agent(
+/// Info needed to spawn a session on a remote host.
+pub struct RemoteSpawn {
+    pub host: String,
+    pub cwd: PathBuf,
+    pub backend: BackendType,
+}
+
+/// Clone a session by ID. For local sessions, creates the new session directly
+/// and returns `None`. For remote sessions, returns `Some(RemoteSpawn)` so the
+/// caller can dispatch it to the remote host.
+pub fn clone_session(
     session_manager: &mut SessionManager,
     directory_picker: &mut DirectoryPicker,
     scene: &mut AgentScene,
     show_scene: bool,
     ai_mode: AiMode,
     hostname: &str,
-) -> Option<SessionId> {
-    let cwd = session_manager
-        .get_active()
-        .and_then(|s| s.cwd().cloned())?;
-    Some(create_session_with_cwd(
+    id: SessionId,
+) -> Option<RemoteSpawn> {
+    let session = session_manager.get(id)?;
+    let cwd = session.cwd().cloned()?;
+    let backend_type = session.backend_type;
+    let model = session
+        .details
+        .resolve_model()
+        .map(|id| Model::from_model_id(&id))
+        .unwrap_or(Model::Default);
+
+    if session.is_remote() {
+        return Some(RemoteSpawn {
+            host: session.details.hostname.clone(),
+            cwd,
+            backend: backend_type,
+        });
+    }
+
+    create_session_with_cwd(
         session_manager,
         directory_picker,
         scene,
@@ -931,7 +1304,11 @@ pub fn clone_active_agent(
         ai_mode,
         cwd,
         hostname,
-    ))
+        backend_type,
+        None,
+        model,
+    );
+    None
 }
 
 /// Delete a session and clean up backend resources.
@@ -986,5 +1363,859 @@ pub fn handle_cd_command(session: &mut ChatSession) -> Option<Result<PathBuf, ()
             .chat
             .push(Message::Error(format!("Invalid directory: {}", path_str)));
         Some(Err(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collapse_state::CollapseState;
+    use crate::focus_queue::{FocusPriority, FocusQueue};
+    use crate::session::{SessionId, SessionSource};
+
+    fn create_named_agent_session(
+        sm: &mut SessionManager,
+        picker: &mut DirectoryPicker,
+        scene: &mut AgentScene,
+        hostname: &str,
+        cwd: &str,
+        title: &str,
+    ) -> SessionId {
+        let id = create_session_with_cwd(
+            sm,
+            picker,
+            scene,
+            false,
+            AiMode::Agentic,
+            PathBuf::from(cwd),
+            hostname,
+            BackendType::Claude,
+            None,
+            Model::Default,
+        );
+
+        let session = sm.get_mut(id).expect("session should exist");
+        session.details.title = title.to_string();
+        session.details.custom_title = None;
+        session.details.home_dir = "/home/tester".to_string();
+
+        sm.rebuild_cwd_groups();
+        id
+    }
+
+    fn create_remote_agent_session(
+        sm: &mut SessionManager,
+        picker: &mut DirectoryPicker,
+        scene: &mut AgentScene,
+    ) -> SessionId {
+        let id = create_session_with_cwd(
+            sm,
+            picker,
+            scene,
+            false,
+            AiMode::Agentic,
+            PathBuf::from("/tmp"),
+            "remote-a",
+            BackendType::Claude,
+            None,
+            Model::Default,
+        );
+        let session = sm.get_mut(id).expect("session should exist");
+        session.source = SessionSource::Remote;
+        id
+    }
+
+    fn find_permission_request(
+        session: &crate::session::ChatSession,
+        request_id: uuid::Uuid,
+    ) -> &PermissionRequest {
+        session
+            .chat
+            .iter()
+            .find_map(|msg| match msg {
+                Message::PermissionRequest(req) if req.id == request_id => Some(req),
+                _ => None,
+            })
+            .expect("permission request should exist")
+    }
+
+    #[test]
+    fn pending_permission_skips_runtime_allowed_remote_requests() {
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+        let id = create_remote_agent_session(&mut sm, &mut picker, &mut scene);
+        let allowed_id = uuid::Uuid::new_v4();
+        let next_id = uuid::Uuid::new_v4();
+
+        let session = sm.get_mut(id).expect("session should exist");
+        session
+            .chat
+            .push(Message::PermissionRequest(PermissionRequest::new(
+                allowed_id,
+                "Bash".to_owned(),
+                serde_json::json!({"command": "echo hi"}),
+                Some(PermissionView::RawFallback),
+                None,
+                None,
+            )));
+        session
+            .chat
+            .push(Message::PermissionRequest(PermissionRequest::new(
+                next_id,
+                "AskUserQuestion".to_owned(),
+                serde_json::json!({}),
+                Some(PermissionView::QuestionSet(
+                    crate::messages::QuestionSetInput {
+                        questions: vec![crate::messages::UserQuestion {
+                            question: "Pick one".to_owned(),
+                            header: "choice".to_owned(),
+                            multi_select: false,
+                            options: vec![crate::messages::QuestionOption {
+                                label: "A".to_owned(),
+                                description: "Option A".to_owned(),
+                            }],
+                        }],
+                    },
+                )),
+                None,
+                None,
+            )));
+
+        if let Some(agentic) = &mut session.agentic {
+            let _ = agentic.add_runtime_allow("Bash", &serde_json::json!({"command": "echo hi"}));
+        }
+
+        assert_eq!(first_pending_permission(&sm), Some(next_id));
+        assert_eq!(pending_permission(&sm).map(|req| req.id), Some(next_id));
+        assert!(has_pending_question(&sm));
+    }
+
+    /// clone_session must preserve the source session's model override
+    /// instead of hardcoding Model::Default.
+    #[test]
+    fn clone_session_preserves_model() {
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+
+        // Create a session with Model::Opus
+        let orig_id = create_session_with_cwd(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            false,
+            AiMode::Agentic,
+            PathBuf::from("/tmp"),
+            "localhost",
+            BackendType::Claude,
+            None,
+            Model::Opus,
+        );
+
+        // Verify the original session has the model set
+        let orig_model = sm.get(orig_id).unwrap().details.requested_model.clone();
+        assert!(orig_model.is_some(), "original session should have a model");
+
+        // Clone it
+        let spawn = clone_session(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            false,
+            AiMode::Agentic,
+            "localhost",
+            orig_id,
+        );
+        assert!(spawn.is_none(), "local clone should not return RemoteSpawn");
+
+        // The new session should be the active one (most recently created)
+        let new_id = sm.active_id().unwrap();
+        assert_ne!(new_id, orig_id);
+
+        let new_model = sm.get(new_id).unwrap().details.requested_model.clone();
+        assert_eq!(
+            new_model, orig_model,
+            "cloned session should preserve the model from the original"
+        );
+    }
+
+    /// clone_session with Model::Default should keep model as None.
+    #[test]
+    fn clone_session_preserves_default_model() {
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+
+        let orig_id = create_session_with_cwd(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            false,
+            AiMode::Agentic,
+            PathBuf::from("/tmp"),
+            "localhost",
+            BackendType::Claude,
+            None,
+            Model::Default,
+        );
+
+        assert!(sm.get(orig_id).unwrap().details.requested_model.is_none());
+
+        clone_session(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            false,
+            AiMode::Agentic,
+            "localhost",
+            orig_id,
+        );
+
+        let new_id = sm.active_id().unwrap();
+        assert!(
+            sm.get(new_id).unwrap().details.requested_model.is_none(),
+            "cloned default-model session should also have no model"
+        );
+    }
+
+    /// clone_session must preserve the original requested model override,
+    /// not the backend-reported runtime model shown in the UI.
+    #[test]
+    fn clone_session_uses_requested_model_not_runtime_model() {
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+
+        let orig_id = create_session_with_cwd(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            false,
+            AiMode::Agentic,
+            PathBuf::from("/tmp"),
+            "localhost",
+            BackendType::Codex,
+            None,
+            Model::Custom("gpt-5.2-codex".to_string()),
+        );
+
+        let session = sm.get_mut(orig_id).unwrap();
+        session.details.model = Some("gpt-5.2-codex-2026-03-01".to_string());
+
+        clone_session(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            false,
+            AiMode::Agentic,
+            "localhost",
+            orig_id,
+        );
+
+        let new_id = sm.active_id().unwrap();
+        let new_session = sm.get(new_id).unwrap();
+        assert_eq!(
+            new_session.details.requested_model.as_deref(),
+            Some("gpt-5.2-codex"),
+            "clone should preserve the original requested override"
+        );
+        assert_eq!(
+            new_session.details.model.as_deref(),
+            Some("gpt-5.2-codex"),
+            "new session should start from the requested override until the backend reports otherwise"
+        );
+    }
+
+    #[test]
+    fn focus_queue_next_skips_sessions_hidden_by_collapsed_cwd() {
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+        let mut focus_queue = FocusQueue::new();
+
+        let visible_id = create_named_agent_session(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            "remote-a",
+            "/srv/visible",
+            "Visible",
+        );
+        let hidden_id = create_named_agent_session(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            "remote-a",
+            "/srv/hidden",
+            "Hidden",
+        );
+        // Second session in /srv/hidden so its cwd is collapsible
+        // (single-session cwds skip the folder header and are always visible).
+        let _hidden_sibling = create_named_agent_session(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            "remote-a",
+            "/srv/hidden",
+            "Hidden sibling",
+        );
+
+        let mut collapse = CollapseState::new();
+        collapse.toggle_cwd("remote-a", std::path::Path::new("/srv/hidden"));
+
+        sm.switch_to(hidden_id);
+
+        focus_queue.enqueue(hidden_id, FocusPriority::NeedsInput);
+        focus_queue.enqueue(visible_id, FocusPriority::Error);
+        focus_queue.set_cursor(1);
+
+        assert_eq!(sm.active_id(), Some(hidden_id));
+
+        focus_queue_next(&mut sm, &mut focus_queue, &collapse, &mut scene, false);
+
+        assert_eq!(sm.active_id(), Some(visible_id));
+        assert_eq!(
+            focus_queue.current().map(|entry| entry.session_id),
+            Some(visible_id)
+        );
+    }
+
+    #[test]
+    fn auto_steal_ignores_collapsed_needs_input_and_uses_visible_done() {
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+        let mut focus_queue = FocusQueue::new();
+
+        let home_id =
+            create_named_agent_session(&mut sm, &mut picker, &mut scene, "", "/work/home", "Home");
+        let hidden_needs_input = create_named_agent_session(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            "remote-a",
+            "/srv/hidden",
+            "Needs input",
+        );
+        let visible_done = create_named_agent_session(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            "remote-b",
+            "/srv/done",
+            "Done",
+        );
+
+        sm.switch_to(home_id);
+
+        let mut collapse = CollapseState::new();
+        collapse.toggle_host("remote-a");
+
+        focus_queue.enqueue(hidden_needs_input, FocusPriority::NeedsInput);
+        focus_queue.enqueue(visible_done, FocusPriority::Done);
+
+        let mut home_session = None;
+        let stole_focus = process_auto_steal_focus(
+            &mut sm,
+            &mut focus_queue,
+            &collapse,
+            &mut scene,
+            false,
+            true,
+            &mut home_session,
+        );
+
+        assert!(stole_focus);
+        assert_eq!(sm.active_id(), Some(visible_done));
+        assert_eq!(home_session, Some(home_id));
+        assert_eq!(
+            focus_queue.current().map(|entry| entry.session_id),
+            Some(visible_done)
+        );
+    }
+
+    #[test]
+    fn remote_permission_response_without_publish_metadata_keeps_request_pending() {
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+        let id = create_remote_agent_session(&mut sm, &mut picker, &mut scene);
+        let request_id = uuid::Uuid::new_v4();
+
+        let session = sm.get_mut(id).expect("session should exist");
+        session
+            .chat
+            .push(Message::PermissionRequest(PermissionRequest::new(
+                request_id,
+                "Bash".to_owned(),
+                serde_json::json!({"command": "echo hi"}),
+                Some(PermissionView::RawFallback),
+                None,
+                None,
+            )));
+
+        let publish = handle_permission_response(
+            &mut sm,
+            request_id,
+            PermissionResponse::Allow {
+                message: Some("ack".to_owned()),
+            },
+        );
+        assert!(
+            publish.is_none(),
+            "remote response without metadata should not publish"
+        );
+
+        let session = sm.get(id).expect("session should exist");
+        let req = find_permission_request(session, request_id);
+        assert_eq!(
+            req.response, None,
+            "missing metadata must not resolve the request locally"
+        );
+        assert!(
+            !session
+                .agentic
+                .as_ref()
+                .expect("agentic session")
+                .permissions
+                .responded
+                .contains_key(&request_id),
+            "missing metadata must not mark request as responded"
+        );
+    }
+
+    #[test]
+    fn local_permission_response_with_publish_metadata_returns_publish() {
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+        let id = create_named_agent_session(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            "localhost",
+            "/tmp",
+            "Local",
+        );
+        let request_id = uuid::Uuid::new_v4();
+        let request_note_id = [7_u8; 32];
+
+        let session = sm.get_mut(id).expect("session should exist");
+        session
+            .chat
+            .push(Message::PermissionRequest(PermissionRequest::new(
+                request_id,
+                "Bash".to_owned(),
+                serde_json::json!({"command": "echo hi"}),
+                Some(PermissionView::RawFallback),
+                None,
+                None,
+            )));
+        let expected_event_session_id = session
+            .agentic
+            .as_ref()
+            .expect("agentic session")
+            .event_session_id()
+            .to_owned();
+        session
+            .agentic
+            .as_mut()
+            .expect("agentic session")
+            .permissions
+            .request_note_ids
+            .insert(request_id, request_note_id);
+
+        let publish = handle_permission_response(
+            &mut sm,
+            request_id,
+            PermissionResponse::Allow { message: None },
+        )
+        .expect("local response with metadata should return publish payload");
+        assert_eq!(publish.perm_id, request_id);
+        assert_eq!(publish.event_session_id, expected_event_session_id);
+        assert_eq!(publish.request_note_id, request_note_id);
+        assert!(publish.allowed);
+        assert_eq!(publish.message, None);
+        assert!(!publish.cancel_turn);
+
+        let session = sm.get(id).expect("session should exist");
+        let req = find_permission_request(session, request_id);
+        assert_eq!(
+            req.response,
+            Some(crate::messages::PermissionResponseType::Allowed)
+        );
+    }
+
+    #[test]
+    fn remote_question_response_without_publish_metadata_keeps_request_pending() {
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+        let id = create_remote_agent_session(&mut sm, &mut picker, &mut scene);
+        let request_id = uuid::Uuid::new_v4();
+
+        let session = sm.get_mut(id).expect("session should exist");
+        session
+            .chat
+            .push(Message::PermissionRequest(PermissionRequest::new(
+                request_id,
+                "AskUserQuestion".to_owned(),
+                serde_json::json!({}),
+                Some(PermissionView::QuestionSet(
+                    crate::messages::QuestionSetInput {
+                        questions: vec![crate::messages::UserQuestion {
+                            question: "Pick one".to_owned(),
+                            header: "choice".to_owned(),
+                            multi_select: false,
+                            options: vec![crate::messages::QuestionOption {
+                                label: "A".to_owned(),
+                                description: "Option A".to_owned(),
+                            }],
+                        }],
+                    },
+                )),
+                None,
+                None,
+            )));
+        if let Some(agentic) = &mut session.agentic {
+            agentic.question_answers.insert(
+                request_id,
+                vec![QuestionAnswer {
+                    selected: vec![0],
+                    other_text: None,
+                }],
+            );
+            agentic.question_index.insert(request_id, 0);
+        }
+
+        let publish = handle_question_response(
+            &mut sm,
+            request_id,
+            vec![QuestionAnswer {
+                selected: vec![0],
+                other_text: None,
+            }],
+        );
+        assert!(
+            publish.is_none(),
+            "remote question response without metadata should not publish"
+        );
+
+        let session = sm.get(id).expect("session should exist");
+        let req = find_permission_request(session, request_id);
+        assert_eq!(
+            req.response, None,
+            "missing metadata must not resolve question request locally"
+        );
+        let agentic = session.agentic.as_ref().expect("agentic session");
+        assert!(
+            !agentic.permissions.responded.contains_key(&request_id),
+            "missing metadata must not mark question request as responded"
+        );
+        assert!(
+            agentic.question_answers.contains_key(&request_id),
+            "missing metadata should keep staged answers for retry"
+        );
+        assert!(
+            agentic.question_index.contains_key(&request_id),
+            "missing metadata should keep staged question index for retry"
+        );
+    }
+
+    #[test]
+    fn local_question_response_with_publish_metadata_returns_publish() {
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+        let id = create_named_agent_session(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            "localhost",
+            "/tmp",
+            "Local Question",
+        );
+        let request_id = uuid::Uuid::new_v4();
+        let request_note_id = [9_u8; 32];
+
+        let session = sm.get_mut(id).expect("session should exist");
+        session
+            .chat
+            .push(Message::PermissionRequest(PermissionRequest::new(
+                request_id,
+                "AskUserQuestion".to_owned(),
+                serde_json::json!({}),
+                Some(PermissionView::QuestionSet(
+                    crate::messages::QuestionSetInput {
+                        questions: vec![crate::messages::UserQuestion {
+                            question: "Pick one".to_owned(),
+                            header: "choice".to_owned(),
+                            multi_select: false,
+                            options: vec![crate::messages::QuestionOption {
+                                label: "A".to_owned(),
+                                description: "Option A".to_owned(),
+                            }],
+                        }],
+                    },
+                )),
+                None,
+                None,
+            )));
+        let expected_event_session_id = session
+            .agentic
+            .as_ref()
+            .expect("agentic session")
+            .event_session_id()
+            .to_owned();
+        session
+            .agentic
+            .as_mut()
+            .expect("agentic session")
+            .permissions
+            .request_note_ids
+            .insert(request_id, request_note_id);
+
+        let publish = handle_question_response(
+            &mut sm,
+            request_id,
+            vec![QuestionAnswer {
+                selected: vec![0],
+                other_text: None,
+            }],
+        )
+        .expect("local question response with metadata should return publish payload");
+        assert_eq!(publish.perm_id, request_id);
+        assert_eq!(publish.event_session_id, expected_event_session_id);
+        assert_eq!(publish.request_note_id, request_note_id);
+        assert!(publish.allowed);
+        assert!(!publish.cancel_turn);
+
+        let payload = publish
+            .message
+            .expect("question response should have payload");
+        let value: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload should be valid json");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "answers": {
+                    "choice": {
+                        "selected": ["A"]
+                    }
+                }
+            })
+        );
+
+        let session = sm.get(id).expect("session should exist");
+        let req = find_permission_request(session, request_id);
+        assert_eq!(
+            req.response,
+            Some(crate::messages::PermissionResponseType::Allowed)
+        );
+    }
+
+    #[test]
+    fn open_terminal_uses_override_and_launches_in_requested_cwd() {
+        use std::io::ErrorKind;
+
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let cwd = tempdir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let output_path = tempdir.path().join("pwd.txt");
+        #[cfg(windows)]
+        let script_path = tempdir.path().join("terminal.cmd");
+        #[cfg(not(windows))]
+        let script_path = tempdir.path().join("terminal.sh");
+
+        #[cfg(windows)]
+        std::fs::write(
+            &script_path,
+            format!("@echo off\r\ncd > \"{}\"\r\n", output_path.display()),
+        )
+        .unwrap();
+
+        #[cfg(not(windows))]
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\npwd > \"{}\"\n", output_path.display()),
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert!(
+            open_terminal_with_terminal(&cwd, script_path.to_str()),
+            "terminal override should launch successfully"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let launched_cwd = loop {
+            match std::fs::read_to_string(&output_path) {
+                Ok(contents) => break contents,
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "terminal script did not write its cwd before timeout"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(err) => panic!("failed reading terminal output: {err}"),
+            }
+        };
+
+        let launched_cwd = std::path::PathBuf::from(launched_cwd.trim_end());
+        assert_eq!(
+            launched_cwd.canonicalize().unwrap(),
+            cwd.canonicalize().unwrap()
+        );
+    }
+
+    /// Helper: create a SessionManager with one session and set up an
+    /// EditorJob backed by a real temp file and a trivially-exited child.
+    fn editor_test_setup(
+        test_name: &str,
+        temp_content: &str,
+        spawn_done_sentinel: bool,
+    ) -> (SessionManager, PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        let mut sm = SessionManager::new();
+        let mut picker = DirectoryPicker::new();
+        let mut scene = AgentScene::new();
+
+        let id = create_session_with_cwd(
+            &mut sm,
+            &mut picker,
+            &mut scene,
+            false,
+            AiMode::Agentic,
+            PathBuf::from("/tmp"),
+            "localhost",
+            BackendType::Claude,
+            None,
+            Model::Default,
+        );
+
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_path = std::env::temp_dir().join(format!(
+            "notedeck_editor_test_{}_{}_{}.txt",
+            test_name, id, unique
+        ));
+        std::fs::write(&temp_path, temp_content).unwrap();
+
+        if spawn_done_sentinel {
+            let done_path = temp_path.with_extension("done");
+            std::fs::write(&done_path, "").unwrap();
+        }
+
+        // Spawn a child that exits immediately (simulates a daemonizing terminal).
+        let child = std::process::Command::new("true").spawn().unwrap();
+
+        sm.pending_editor = Some(crate::session::EditorJob {
+            child,
+            temp_path: temp_path.clone(),
+            session_id: id,
+        });
+
+        (sm, temp_path)
+    }
+
+    /// When the sentinel .done file exists, poll_editor_job should read
+    /// the temp file content into the session input and clean up.
+    #[test]
+    fn poll_editor_job_reads_content_on_sentinel() {
+        // Create the wrapper .sh script so poll_editor_job uses sentinel mode
+        let (mut sm, temp_path) = editor_test_setup("sentinel", "hello from editor", true);
+        let script_path = temp_path.with_extension("sh");
+        std::fs::write(&script_path, "#!/bin/sh\n").unwrap();
+
+        poll_editor_job(&mut sm);
+
+        // Input should be updated
+        let session = sm.get(sm.active_id().unwrap()).unwrap();
+        assert_eq!(session.input, "hello from editor");
+
+        // Pending editor should be cleared
+        assert!(sm.pending_editor.is_none());
+
+        // Temp files should be cleaned up
+        assert!(!temp_path.exists());
+        assert!(!temp_path.with_extension("done").exists());
+        assert!(!script_path.exists());
+    }
+
+    /// When using sentinel mode (wrapper .sh script exists) and the sentinel
+    /// .done file does NOT exist yet, poll_editor_job should NOT read the
+    /// file, even if the child process has exited. This is the daemonizing
+    /// terminal case.
+    #[test]
+    fn poll_editor_job_waits_for_sentinel_on_linux() {
+        let (mut sm, temp_path) = editor_test_setup("waits", "user text", false);
+
+        // Create the .sh script so sentinel mode is active
+        let script_path = temp_path.with_extension("sh");
+        std::fs::write(&script_path, "#!/bin/sh\n").unwrap();
+
+        // Wait for the child to exit (it's `true`, so basically instant)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        poll_editor_job(&mut sm);
+
+        // Editor should still be pending — no sentinel yet
+        assert!(
+            sm.pending_editor.is_some(),
+            "should NOT finish without sentinel even though child exited"
+        );
+
+        // Now create the sentinel
+        std::fs::write(temp_path.with_extension("done"), "").unwrap();
+
+        poll_editor_job(&mut sm);
+
+        // Now it should have read the file
+        let session = sm.get(sm.active_id().unwrap()).unwrap();
+        assert_eq!(session.input, "user text");
+        assert!(sm.pending_editor.is_none());
+
+        // Cleanup
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    /// Without a wrapper script (macOS path), poll_editor_job should
+    /// fall back to child exit for completion detection.
+    #[test]
+    fn poll_editor_job_falls_back_to_child_exit_without_script() {
+        let (mut sm, temp_path) = editor_test_setup("fallback", "macos content", false);
+        // No .sh script — simulates macOS path
+
+        // Verify no .sh script exists (sentinel mode should be off)
+        let script_path = temp_path.with_extension("sh");
+        assert!(
+            !script_path.exists(),
+            "no .sh script should exist for fallback test"
+        );
+
+        // Ensure the child process has exited before polling.
+        if let Some(ref mut job) = sm.pending_editor {
+            let _ = job.child.wait();
+        }
+
+        poll_editor_job(&mut sm);
+
+        // Should complete based on child exit alone
+        assert!(
+            sm.pending_editor.is_none(),
+            "pending_editor should be cleared after child exited"
+        );
+        let session = sm.get(sm.active_id().unwrap()).unwrap();
+        assert_eq!(session.input, "macos content");
+        assert!(!temp_path.exists());
     }
 }

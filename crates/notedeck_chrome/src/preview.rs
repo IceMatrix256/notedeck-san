@@ -1,5 +1,5 @@
 use notedeck::{DataPath, Notedeck};
-use notedeck_chrome::setup::{generate_native_options, setup_chrome};
+use notedeck_chrome::setup::generate_native_options;
 use notedeck_columns::ui::configure_deck::ConfigureDeckView;
 use notedeck_columns::ui::edit_deck::EditDeckView;
 use notedeck_columns::ui::profile::EditProfileView;
@@ -27,7 +27,7 @@ impl PreviewRunner {
 
         let _res = eframe::run_native(
             "Notedeck Preview",
-            generate_native_options(path),
+            generate_native_options(path, false),
             Box::new(|cc| {
                 let args: Vec<String> = std::env::args().collect();
                 let ctx = &cc.egui_ctx;
@@ -38,13 +38,7 @@ impl PreviewRunner {
                     "unrecognized args: {:?}",
                     notedeck.unrecognized_args()
                 );
-                setup_chrome(
-                    ctx,
-                    notedeck.args(),
-                    notedeck.theme(),
-                    notedeck.note_body_font_size(),
-                    notedeck.zoom_factor(),
-                );
+                notedeck.setup(ctx);
 
                 notedeck.set_app(PreviewApp::new(preview));
 

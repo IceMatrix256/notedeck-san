@@ -164,21 +164,27 @@ impl<'a, 'd> SearchView<'a, 'd> {
             return;
         };
 
-        's: {
-            let Ok(results) = self
+        if self.query.last_mention_query != mention_name {
+            let contacts = self
                 .note_context
-                .ndb
-                .search_profile(self.txn, mention_name, 10)
-            else {
-                break 's;
-            };
+                .accounts
+                .get_selected_account()
+                .data
+                .contacts
+                .get_state();
+            self.query.mention_results =
+                search_profiles(self.note_context.ndb, self.txn, mention_name, contacts, 128);
+            self.query.last_mention_query = mention_name.to_owned();
+        }
 
+        's: {
             let search_res = MentionPickerView::new(
                 self.note_context.img_cache,
                 self.note_context.ndb,
                 self.txn,
-                &results,
+                &self.query.mention_results,
                 self.note_context.jobs,
+                self.note_context.i18n,
             )
             .show_in_rect(ui.available_rect_before_wrap(), ui);
 
@@ -188,20 +194,20 @@ impl<'a, 'd> SearchView<'a, 'd> {
 
             *search_action = match res {
                 MentionPickerResponse::SelectResult(Some(index)) => {
-                    let Some(pk_bytes) = results.get(index) else {
+                    let Some(result) = self.query.mention_results.get(index) else {
                         break 's;
                     };
 
                     let username = self
                         .note_context
                         .ndb
-                        .get_profile_by_pubkey(self.txn, pk_bytes)
+                        .get_profile_by_pubkey(self.txn, &result.pk)
                         .ok()
                         .and_then(|p| p.record().profile().and_then(|p| p.name()))
                         .unwrap_or(&self.query.string);
 
                     Some(SearchAction::NewSearch {
-                        search_type: SearchType::Profile(Pubkey::new(**pk_bytes)),
+                        search_type: SearchType::Profile(Pubkey::new(result.pk)),
                         new_search_text: format!("@{username}"),
                     })
                 }
@@ -535,12 +541,12 @@ fn search_box(
     clipboard: &mut Clipboard,
 ) -> SearchResponse {
     ui.horizontal(|ui| {
-        search_input_frame(ui.visuals().dark_mode)
+        search_input_frame(ui.ctx())
             .show(ui, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 0.0);
+                    ui.spacing_mut().item_spacing = egui::vec2(notedeck::tokens::SPACING_SM, 0.0);
 
-                    ui.add(search_icon(16.0, SEARCH_INPUT_HEIGHT));
+                    ui.add(search_icon(notedeck::tokens::ICON_SM, SEARCH_INPUT_HEIGHT));
 
                     let before_len = input.len();
 
@@ -767,14 +773,14 @@ fn recent_search_item(
                 egui::Pos2::new(x_center.x - x_size / 2.0, x_center.y - x_size / 2.0),
                 egui::Pos2::new(x_center.x + x_size / 2.0, x_center.y + x_size / 2.0),
             ],
-            egui::Stroke::new(1.5, ui.visuals().text_color()),
+            egui::Stroke::new(notedeck::tokens::STROKE_MEDIUM, ui.visuals().text_color()),
         );
         painter.line_segment(
             [
                 egui::Pos2::new(x_center.x + x_size / 2.0, x_center.y - x_size / 2.0),
                 egui::Pos2::new(x_center.x - x_size / 2.0, x_center.y + x_size / 2.0),
             ],
-            egui::Stroke::new(1.5, ui.visuals().text_color()),
+            egui::Stroke::new(notedeck::tokens::STROKE_MEDIUM, ui.visuals().text_color()),
         );
 
         resp

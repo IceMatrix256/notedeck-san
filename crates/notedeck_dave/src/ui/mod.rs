@@ -4,39 +4,48 @@ mod dave;
 pub mod diff;
 pub mod directory_picker;
 mod git_status_ui;
+pub mod host_picker;
 pub mod keybind_hint;
 pub mod keybindings;
 pub mod markdown_ui;
 mod pill;
 mod query_ui;
+pub(crate) mod run_config_editor;
+pub(crate) mod run_ui;
 pub mod scene;
 pub mod session_list;
 pub mod session_picker;
 mod settings;
 mod top_buttons;
+pub mod worktree_creator;
 
 pub use ask_question::{ask_user_question_summary_ui, ask_user_question_ui};
-pub use dave::{DaveAction, DaveResponse, DaveUi};
+pub use dave::{DaveAction, DaveResponse, DaveUi, InputboxLayout, InputboxResult, RunAction};
 pub use directory_picker::{DirectoryPicker, DirectoryPickerAction};
+pub use host_picker::HostPickerAction;
 pub use keybind_hint::{keybind_hint, paint_keybind_hint};
-pub use keybindings::{check_keybindings, KeyAction};
+pub use keybindings::check_keybindings;
+pub(crate) use run_config_editor::{run_config_editor_overlay_ui, RunConfigChange};
 pub use scene::{AgentScene, SceneAction, SceneResponse};
 pub use session_list::{SessionListAction, SessionListUi};
 pub use session_picker::{SessionPicker, SessionPickerAction};
 pub use settings::{DaveSettingsPanel, SettingsPanelAction};
+pub use worktree_creator::{WorktreeCreator, WorktreeCreatorAction};
 
 // =============================================================================
 // Standalone UI Functions
 // =============================================================================
 
 use crate::agent_status::AgentStatus;
+use crate::backend::{BackendType, Model};
 use crate::config::{AiMode, DaveSettings, ModelConfig};
 use crate::focus_queue::FocusQueue;
 use crate::messages::PermissionResponse;
 use crate::session::{ChatSession, PermissionMessageState, SessionId, SessionManager};
-use crate::session_discovery::discover_sessions;
+use crate::ui::keybindings::KeyAction;
 use crate::update;
 use crate::DaveOverlay;
+use egui::include_image;
 
 /// Build a DaveUi from a session, wiring up all the common builder fields.
 fn build_dave_ui<'a>(
@@ -44,11 +53,21 @@ fn build_dave_ui<'a>(
     model_config: &ModelConfig,
     is_interrupt_pending: bool,
     auto_steal_focus: bool,
+    run_configs: &'a std::collections::HashMap<std::path::PathBuf, Vec<crate::config::RunConfig>>,
+    running_sessions: &'a std::collections::HashMap<SessionId, std::collections::HashSet<String>>,
 ) -> DaveUi<'a> {
     let is_working = session.status() == AgentStatus::Working;
     let has_pending_permission = session.has_pending_permissions();
-    let plan_mode_active = session.is_plan_mode();
+    let permission_mode = session.permission_mode();
     let is_remote = session.is_remote();
+    // Look up the run configs for this session's CWD
+    let session_run_configs: &'a [crate::config::RunConfig] = session
+        .cwd()
+        .and_then(|cwd| run_configs.get(cwd))
+        .map(|v| v.as_slice())
+        .unwrap_or(&[]);
+    // The IDs of configs currently running for this session
+    let running_config_ids = running_sessions.get(&session.id);
 
     let mut ui_builder = DaveUi::new(
         model_config.trial,
@@ -61,17 +80,29 @@ fn build_dave_ui<'a>(
     .is_working(is_working)
     .interrupt_pending(is_interrupt_pending)
     .has_pending_permission(has_pending_permission)
-    .plan_mode_active(plan_mode_active)
+    .permission_mode(permission_mode)
     .auto_steal_focus(auto_steal_focus)
     .is_remote(is_remote)
-    .details(&session.details);
+    .dispatch_state(session.dispatch_state)
+    .details(&session.details)
+    .backend_type(session.backend_type)
+    .last_activity(session.last_activity)
+    .run_configs(session_run_configs)
+    .running_config_ids(running_config_ids)
+    .pending_images(&mut session.pending_images);
 
     if let Some(agentic) = &mut session.agentic {
+        let model = agentic
+            .session_info
+            .as_ref()
+            .and_then(|si| si.model.as_deref());
+        let is_compacting = agentic.is_compacting();
         ui_builder = ui_builder
             .permission_message_state(agentic.permission_message_state)
             .question_answers(&mut agentic.question_answers)
             .question_index(&mut agentic.question_index)
-            .is_compacting(agentic.is_compacting);
+            .is_compacting(is_compacting)
+            .usage(&agentic.usage, model);
 
         // Only show git status for local sessions
         if !is_remote {
@@ -100,8 +131,6 @@ pub enum OverlayResult {
     Close,
     /// Directory was selected (no resumable sessions)
     DirectorySelected(std::path::PathBuf),
-    /// Show session picker for the given directory
-    ShowSessionPicker(std::path::PathBuf),
     /// Resume a session
     ResumeSession {
         cwd: std::path::PathBuf,
@@ -116,6 +145,8 @@ pub enum OverlayResult {
     BackToDirectoryPicker,
     /// Apply new settings
     ApplySettings(DaveSettings),
+    /// Host was selected. `None` = local, `Some(hostname)` = remote.
+    HostSelected(Option<String>),
 }
 
 /// Render the settings overlay UI.
@@ -146,12 +177,7 @@ pub fn directory_picker_overlay_ui(
     if let Some(action) = directory_picker.overlay_ui(ui, has_sessions) {
         match action {
             DirectoryPickerAction::DirectorySelected(path) => {
-                let resumable_sessions = discover_sessions(&path);
-                if resumable_sessions.is_empty() {
-                    return OverlayResult::DirectorySelected(path);
-                } else {
-                    return OverlayResult::ShowSessionPicker(path);
-                }
+                return OverlayResult::DirectorySelected(path);
             }
             DirectoryPickerAction::Cancelled => {
                 if has_sessions {
@@ -195,6 +221,222 @@ pub fn session_picker_overlay_ui(
     OverlayResult::None
 }
 
+/// Render the host picker overlay UI.
+pub fn host_picker_overlay_ui(
+    local_hostname: &str,
+    known_hosts: &[String],
+    has_sessions: bool,
+    ui: &mut egui::Ui,
+) -> OverlayResult {
+    if let Some(action) =
+        host_picker::host_picker_overlay_ui(ui, local_hostname, known_hosts, has_sessions)
+    {
+        match action {
+            HostPickerAction::HostSelected(host) => {
+                return OverlayResult::HostSelected(host);
+            }
+            HostPickerAction::Cancelled => {
+                return OverlayResult::Close;
+            }
+        }
+    }
+    OverlayResult::None
+}
+
+/// Render the worktree creator overlay UI.
+pub fn worktree_creator_overlay_ui(
+    creator: &mut WorktreeCreator,
+    ui: &mut egui::Ui,
+    available_backends: &[BackendType],
+) -> Option<WorktreeCreatorAction> {
+    creator.overlay_ui(ui, available_backends)
+}
+
+/// Brand color for a backend type.
+pub fn backend_color(bt: BackendType) -> egui::Color32 {
+    match bt {
+        BackendType::Claude => egui::Color32::from_rgb(0xD9, 0x77, 0x57), // Anthropic terracotta
+        BackendType::Codex => egui::Color32::from_rgb(0x10, 0xA3, 0x7F),  // OpenAI green
+        _ => egui::Color32::WHITE,
+    }
+}
+
+/// Get an icon image for a backend type, tinted with its brand color.
+pub fn backend_icon(bt: BackendType) -> egui::Image<'static> {
+    let img = match bt {
+        BackendType::Claude => {
+            egui::Image::new(include_image!("../../../../assets/icons/claude-code.svg"))
+        }
+        BackendType::Codex => {
+            egui::Image::new(include_image!("../../../../assets/icons/codex.svg"))
+        }
+        _ => egui::Image::new(include_image!("../../../../assets/icons/sparkle.svg")),
+    };
+    img.tint(backend_color(bt))
+}
+
+/// Resolve the model index to a Model variant.
+/// Index 0 = Default, 1+ = specific model from available_models.
+fn resolve_picker_model(bt: BackendType, model_idx: usize) -> Model {
+    if model_idx == 0 {
+        Model::Default
+    } else {
+        bt.available_models()
+            .into_iter()
+            .nth(model_idx - 1)
+            .unwrap_or(Model::Default)
+    }
+}
+
+/// Render a single backend row in the picker: icon, name, model dropdown, start button.
+/// Returns `Some(model)` if the user clicked Start for this backend.
+fn backend_picker_row(
+    bt: BackendType,
+    idx: usize,
+    max_width: f32,
+    selected_models: &mut std::collections::HashMap<BackendType, usize>,
+    ui: &mut egui::Ui,
+) -> Option<Model> {
+    let models = bt.available_models();
+    // Index 0 = "Default", 1..=N = specific overrides
+    let model_idx = selected_models.get(&bt).copied().unwrap_or(0);
+    let selected_model = resolve_picker_model(bt, model_idx);
+    let display_name = selected_model.display_name();
+
+    // Backend row: icon + name + model dropdown + GO button
+    let desired = egui::vec2(max_width, 52.0);
+    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+
+    // Background
+    let fill = ui.visuals().widgets.inactive.weak_bg_fill;
+    ui.painter().rect_filled(rect, 8.0, fill);
+
+    // Icon
+    let icon_size = 20.0;
+    let icon_x = rect.left() + 12.0;
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(icon_x + icon_size / 2.0, rect.center().y - 6.0),
+        egui::vec2(icon_size, icon_size),
+    );
+    backend_icon(bt).paint_at(ui, icon_rect);
+
+    // Backend name + keyboard shortcut
+    let label = format!("[{}] {}", idx + 1, bt.display_name());
+    ui.painter().text(
+        egui::pos2(icon_x + icon_size + 10.0, rect.center().y - 6.0),
+        egui::Align2::LEFT_CENTER,
+        &label,
+        egui::FontId::proportional(15.0),
+        ui.visuals().text_color(),
+    );
+
+    // Model selector + Start button on the second line
+    let controls_rect = egui::Rect::from_min_size(
+        egui::pos2(icon_x + icon_size + 10.0, rect.center().y + 4.0),
+        egui::vec2(max_width - icon_size - 34.0, 20.0),
+    );
+
+    let mut result = None;
+
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(controls_rect), |ui| {
+        ui.horizontal(|ui| {
+            // Model dropdown: index 0 = "Default", then each override model
+            if !models.is_empty() {
+                let combo_id = ui.id().with("model").with(idx);
+                egui::ComboBox::from_id_salt(combo_id)
+                    .selected_text(egui::RichText::new(display_name).size(11.0))
+                    .width(160.0)
+                    .show_ui(ui, |ui| {
+                        // "Default" entry
+                        if ui.selectable_label(model_idx == 0, "Default").clicked() {
+                            selected_models.insert(bt, 0);
+                        }
+                        // Specific model overrides
+                        for (mi, m) in models.iter().enumerate() {
+                            if ui
+                                .selectable_label(model_idx == mi + 1, m.display_name())
+                                .clicked()
+                            {
+                                selected_models.insert(bt, mi + 1);
+                            }
+                        }
+                    });
+            }
+
+            // Start button
+            if ui
+                .add(egui::Button::new(egui::RichText::new("Start").size(12.0)).corner_radius(4.0))
+                .clicked()
+            {
+                result = Some(resolve_picker_model(bt, model_idx));
+            }
+        });
+    });
+
+    ui.add_space(6.0);
+
+    result
+}
+
+/// Render the backend picker overlay UI.
+/// Returns `Some((BackendType, Model))` when the user has selected a backend.
+pub fn backend_picker_overlay_ui(
+    available_backends: &[BackendType],
+    selected_models: &mut std::collections::HashMap<BackendType, usize>,
+    ui: &mut egui::Ui,
+) -> Option<(BackendType, Model)> {
+    // Handle keyboard shortcuts: 1-9 for quick selection
+    for (idx, &bt) in available_backends.iter().enumerate().take(9) {
+        let key = match idx {
+            0 => egui::Key::Num1,
+            1 => egui::Key::Num2,
+            2 => egui::Key::Num3,
+            3 => egui::Key::Num4,
+            4 => egui::Key::Num5,
+            _ => continue,
+        };
+        if ui.input(|i| i.key_pressed(key)) {
+            let model_idx = selected_models.get(&bt).copied().unwrap_or(0);
+            return Some((bt, resolve_picker_model(bt, model_idx)));
+        }
+    }
+
+    let is_narrow = notedeck::ui::is_narrow(ui.ctx());
+    let mut selected = None;
+
+    egui::Frame::new()
+        .fill(ui.visuals().panel_fill)
+        .inner_margin(egui::Margin::symmetric(if is_narrow { 16 } else { 40 }, 20))
+        .show(ui, |ui| {
+            ui.heading("Select Backend");
+            ui.add_space(8.0);
+            ui.label("Choose which AI backend to use for this session:");
+            ui.add_space(16.0);
+
+            let max_width = if is_narrow {
+                ui.available_width()
+            } else {
+                400.0
+            };
+
+            ui.allocate_ui_with_layout(
+                egui::vec2(max_width, ui.available_height()),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    for (idx, &bt) in available_backends.iter().enumerate() {
+                        if let Some(model) =
+                            backend_picker_row(bt, idx, max_width, selected_models, ui)
+                        {
+                            selected = Some((bt, model));
+                        }
+                    }
+                },
+            );
+        });
+
+    selected
+}
+
 /// Scene view action returned after rendering
 pub enum SceneViewAction {
     None,
@@ -208,10 +450,12 @@ pub enum SceneViewAction {
 pub fn scene_ui(
     session_manager: &mut SessionManager,
     scene: &mut AgentScene,
-    focus_queue: &FocusQueue,
+    focus_queue: &mut FocusQueue,
     model_config: &ModelConfig,
     is_interrupt_pending: bool,
     auto_steal_focus: bool,
+    run_configs: &std::collections::HashMap<std::path::PathBuf, Vec<crate::config::RunConfig>>,
+    running_sessions: &std::collections::HashMap<SessionId, std::collections::HashSet<String>>,
     app_ctx: &mut notedeck::AppContext,
     ui: &mut egui::Ui,
 ) -> (DaveResponse, SceneViewAction) {
@@ -263,7 +507,7 @@ pub fn scene_ui(
                     .show(ui, |ui| {
                         if let Some(selected_id) = scene.primary_selection() {
                             if let Some(session) = session_manager.get_mut(selected_id) {
-                                ui.heading(&session.details.title);
+                                ui.heading(session.details.display_title());
                                 ui.separator();
 
                                 let response = build_dave_ui(
@@ -271,6 +515,8 @@ pub fn scene_ui(
                                     model_config,
                                     is_interrupt_pending,
                                     auto_steal_focus,
+                                    run_configs,
+                                    running_sessions,
                                 )
                                 .compact(true)
                                 .ui(app_ctx, ui);
@@ -294,6 +540,7 @@ pub fn scene_ui(
                 SceneAction::SelectionChanged(ids) => {
                     if let Some(id) = ids.first() {
                         session_manager.switch_to(*id);
+                        focus_queue.dequeue(*id);
                     }
                 }
                 SceneAction::SpawnAgent => {
@@ -321,9 +568,12 @@ pub fn scene_ui(
 pub fn desktop_ui(
     session_manager: &mut SessionManager,
     focus_queue: &FocusQueue,
+    collapse_state: &crate::collapse_state::CollapseState,
     model_config: &ModelConfig,
     is_interrupt_pending: bool,
     auto_steal_focus: bool,
+    run_configs: &std::collections::HashMap<std::path::PathBuf, Vec<crate::config::RunConfig>>,
+    running_sessions: &std::collections::HashMap<SessionId, std::collections::HashSet<String>>,
     app_ctx: &mut notedeck::AppContext,
     ui: &mut egui::Ui,
 ) -> (DaveResponse, Option<SessionListAction>, bool) {
@@ -368,7 +618,8 @@ pub fn desktop_ui(
                         });
                         ui.separator();
                     }
-                    SessionListUi::new(session_manager, focus_queue, ctrl_held).ui(ui)
+                    SessionListUi::new(session_manager, focus_queue, collapse_state, ctrl_held)
+                        .ui(ui)
                 })
                 .inner
         })
@@ -382,6 +633,8 @@ pub fn desktop_ui(
                     model_config,
                     is_interrupt_pending,
                     auto_steal_focus,
+                    run_configs,
+                    running_sessions,
                 )
                 .ui(app_ctx, ui)
             } else {
@@ -398,9 +651,12 @@ pub fn desktop_ui(
 pub fn narrow_ui(
     session_manager: &mut SessionManager,
     focus_queue: &FocusQueue,
+    collapse_state: &crate::collapse_state::CollapseState,
     model_config: &ModelConfig,
     is_interrupt_pending: bool,
     auto_steal_focus: bool,
+    run_configs: &std::collections::HashMap<std::path::PathBuf, Vec<crate::config::RunConfig>>,
+    running_sessions: &std::collections::HashMap<SessionId, std::collections::HashSet<String>>,
     show_session_list: bool,
     app_ctx: &mut notedeck::AppContext,
     ui: &mut egui::Ui,
@@ -411,19 +667,23 @@ pub fn narrow_ui(
             .fill(ui.visuals().faint_bg_color)
             .inner_margin(egui::Margin::symmetric(8, 12))
             .show(ui, |ui| {
-                SessionListUi::new(session_manager, focus_queue, ctrl_held).ui(ui)
+                SessionListUi::new(session_manager, focus_queue, collapse_state, ctrl_held).ui(ui)
             })
             .inner;
         (DaveResponse::default(), session_action)
     } else if let Some(session) = session_manager.get_active_mut() {
         let dot_color = focus_queue.current().map(|e| e.priority.color());
+        let fq_info = focus_queue.ui_info();
         let response = build_dave_ui(
             session,
             model_config,
             is_interrupt_pending,
             auto_steal_focus,
+            run_configs,
+            running_sessions,
         )
         .status_dot_color(dot_color)
+        .focus_queue_info(fq_info)
         .ui(app_ctx, ui);
         (response, None)
     } else {
@@ -437,10 +697,14 @@ pub enum KeyActionResult {
     ToggleView,
     HandleInterrupt,
     CloneAgent,
+    NewAgent,
     DeleteSession(SessionId),
+    ClearAgent,
     SetAutoSteal(bool),
     /// Permission response needs relay publishing.
     PublishPermissionResponse(update::PermissionPublish),
+    /// Permission mode command needs relay publishing (observer → host).
+    PublishModeCommand(update::ModeCommandPublish),
 }
 
 /// Handle a keybinding action.
@@ -450,11 +714,11 @@ pub fn handle_key_action(
     session_manager: &mut SessionManager,
     scene: &mut AgentScene,
     focus_queue: &mut FocusQueue,
+    collapse_state: &crate::collapse_state::CollapseState,
     backend: &dyn crate::backend::AiBackend,
     show_scene: bool,
     auto_steal_focus: bool,
     home_session: &mut Option<SessionId>,
-    active_overlay: &mut DaveOverlay,
     ctx: &egui::Context,
 ) -> KeyActionResult {
     match key_action {
@@ -500,6 +764,28 @@ pub fn handle_key_action(
             set_tentative_state(session_manager, PermissionMessageState::TentativeDeny);
             KeyActionResult::None
         }
+        KeyAction::AllowAlways => {
+            update::allow_always(session_manager);
+            if let Some(request_id) = update::first_pending_permission(session_manager) {
+                let result = update::handle_permission_response(
+                    session_manager,
+                    request_id,
+                    PermissionResponse::Allow { message: None },
+                );
+                if let Some(session) = session_manager.get_active_mut() {
+                    session.focus_requested = true;
+                }
+                if let Some(publish) = result {
+                    return KeyActionResult::PublishPermissionResponse(publish);
+                }
+            }
+            KeyActionResult::None
+        }
+        KeyAction::TentativeAllowAlways => {
+            update::allow_always(session_manager);
+            set_tentative_state(session_manager, PermissionMessageState::TentativeAccept);
+            KeyActionResult::None
+        }
         KeyAction::CancelTentative => {
             if let Some(session) = session_manager.get_active_mut() {
                 if let Some(agentic) = &mut session.agentic {
@@ -509,30 +795,36 @@ pub fn handle_key_action(
             KeyActionResult::None
         }
         KeyAction::SwitchToAgent(index) => {
-            update::switch_to_agent_by_index(session_manager, scene, show_scene, index);
+            update::switch_to_agent_by_index(
+                session_manager,
+                collapse_state,
+                scene,
+                show_scene,
+                index,
+            );
             KeyActionResult::None
         }
         KeyAction::NextAgent => {
-            update::cycle_next_agent(session_manager, scene, show_scene);
+            update::cycle_next_agent(session_manager, collapse_state, scene, show_scene);
             KeyActionResult::None
         }
         KeyAction::PreviousAgent => {
-            update::cycle_prev_agent(session_manager, scene, show_scene);
+            update::cycle_prev_agent(session_manager, collapse_state, scene, show_scene);
             KeyActionResult::None
         }
-        KeyAction::NewAgent => {
-            *active_overlay = DaveOverlay::DirectoryPicker;
-            KeyActionResult::None
-        }
+        KeyAction::NewAgent => KeyActionResult::NewAgent,
         KeyAction::CloneAgent => KeyActionResult::CloneAgent,
         KeyAction::Interrupt => KeyActionResult::HandleInterrupt,
         KeyAction::ToggleView => KeyActionResult::ToggleView,
-        KeyAction::TogglePlanMode => {
-            update::toggle_plan_mode(session_manager, backend, ctx);
+        KeyAction::CyclePermissionMode => {
+            let publish = update::cycle_permission_mode(session_manager, backend, ctx);
             if let Some(session) = session_manager.get_active_mut() {
                 session.focus_requested = true;
             }
-            KeyActionResult::None
+            match publish {
+                Some(cmd) => KeyActionResult::PublishModeCommand(cmd),
+                None => KeyActionResult::None,
+            }
         }
         KeyAction::DeleteActiveSession => {
             if let Some(id) = session_manager.active_id() {
@@ -541,12 +833,35 @@ pub fn handle_key_action(
                 KeyActionResult::None
             }
         }
+        KeyAction::ClearAgent => KeyActionResult::ClearAgent,
+        KeyAction::RenameAgent => {
+            if let Some(id) = session_manager.active_id() {
+                if let Some(session) = session_manager.get(id) {
+                    let rename_id = egui::Id::new("session_rename_state");
+                    let rename_state = (id, session.details.display_title().to_string());
+                    ctx.data_mut(|d| d.insert_temp(rename_id, rename_state));
+                }
+            }
+            KeyActionResult::None
+        }
         KeyAction::FocusQueueNext => {
-            update::focus_queue_next(session_manager, focus_queue, scene, show_scene);
+            update::focus_queue_next(
+                session_manager,
+                focus_queue,
+                collapse_state,
+                scene,
+                show_scene,
+            );
             KeyActionResult::None
         }
         KeyAction::FocusQueuePrev => {
-            update::focus_queue_prev(session_manager, focus_queue, scene, show_scene);
+            update::focus_queue_prev(
+                session_manager,
+                focus_queue,
+                collapse_state,
+                scene,
+                show_scene,
+            );
             KeyActionResult::None
         }
         KeyAction::FocusQueueToggleDone => {
@@ -566,6 +881,24 @@ pub fn handle_key_action(
         KeyAction::OpenExternalEditor => {
             update::open_external_editor(session_manager);
             KeyActionResult::None
+        }
+        KeyAction::OpenTerminal => {
+            dispatch_open_terminal(session_manager, update::open_terminal);
+            KeyActionResult::None
+        }
+    }
+}
+
+fn dispatch_open_terminal(
+    session_manager: &SessionManager,
+    mut open_terminal: impl FnMut(&std::path::Path),
+) {
+    if let Some(session) = session_manager.get_active() {
+        if session.is_remote() {
+            return;
+        }
+        if let Some(cwd) = session.cwd() {
+            open_terminal(cwd);
         }
     }
 }
@@ -654,6 +987,14 @@ pub enum UiActionResult {
     PublishPermissionResponse(update::PermissionPublish),
     /// Toggle auto-steal focus mode (needs state from DaveApp)
     ToggleAutoSteal,
+    /// New chat requested — caller routes through handle_new_chat()
+    NewChat,
+    /// Trigger manual context compaction
+    Compact,
+    /// Permission mode command needs relay publishing (observer → host).
+    PublishModeCommand(update::ModeCommandPublish),
+    /// Navigate to next focus queue item (mobile)
+    FocusQueueNext,
 }
 
 /// Handle a UI action from DaveUi.
@@ -669,10 +1010,7 @@ pub fn handle_ui_action(
     match action {
         DaveAction::ToggleChrome => UiActionResult::AppAction(notedeck::AppAction::ToggleChrome),
         DaveAction::Note(n) => UiActionResult::AppAction(notedeck::AppAction::Note(n)),
-        DaveAction::NewChat => {
-            *active_overlay = DaveOverlay::DirectoryPicker;
-            UiActionResult::Handled
-        }
+        DaveAction::NewChat => UiActionResult::NewChat,
         DaveAction::Send => UiActionResult::SendAction,
         DaveAction::ShowSessionList => {
             *show_session_list = !*show_session_list;
@@ -694,12 +1032,35 @@ pub fn handle_ui_action(
             update::execute_interrupt(session_manager, backend, ctx);
             UiActionResult::Handled
         }
+        DaveAction::ExitToolCall { request_id } => {
+            update::exit_tool_call(session_manager, request_id).map_or(
+                UiActionResult::Handled,
+                UiActionResult::PublishPermissionResponse,
+            )
+        }
         DaveAction::TentativeAccept => {
             set_tentative_state(session_manager, PermissionMessageState::TentativeAccept);
             UiActionResult::Handled
         }
         DaveAction::TentativeDeny => {
             set_tentative_state(session_manager, PermissionMessageState::TentativeDeny);
+            UiActionResult::Handled
+        }
+        DaveAction::AllowAlways { request_id } => {
+            update::allow_always(session_manager);
+            update::handle_permission_response(
+                session_manager,
+                request_id,
+                PermissionResponse::Allow { message: None },
+            )
+            .map_or(
+                UiActionResult::Handled,
+                UiActionResult::PublishPermissionResponse,
+            )
+        }
+        DaveAction::TentativeAllowAlways => {
+            update::allow_always(session_manager);
+            set_tentative_state(session_manager, PermissionMessageState::TentativeAccept);
             UiActionResult::Handled
         }
         DaveAction::QuestionResponse {
@@ -709,14 +1070,18 @@ pub fn handle_ui_action(
             UiActionResult::Handled,
             UiActionResult::PublishPermissionResponse,
         ),
-        DaveAction::TogglePlanMode => {
-            update::toggle_plan_mode(session_manager, backend, ctx);
+        DaveAction::CyclePermissionMode => {
+            let publish = update::cycle_permission_mode(session_manager, backend, ctx);
             if let Some(session) = session_manager.get_active_mut() {
                 session.focus_requested = true;
             }
-            UiActionResult::Handled
+            match publish {
+                Some(cmd) => UiActionResult::PublishModeCommand(cmd),
+                None => UiActionResult::Handled,
+            }
         }
         DaveAction::ToggleAutoSteal => UiActionResult::ToggleAutoSteal,
+        DaveAction::FocusQueueNext => UiActionResult::FocusQueueNext,
         DaveAction::ExitPlanMode {
             request_id,
             approved,
@@ -742,5 +1107,76 @@ pub fn handle_ui_action(
                 UiActionResult::PublishPermissionResponse,
             )
         }
+        DaveAction::CompactAndApprove { request_id } => {
+            update::exit_plan_mode(session_manager, backend, ctx);
+            let result = update::handle_permission_response(
+                session_manager,
+                request_id,
+                PermissionResponse::Allow { message: None },
+            );
+            if let Some(session) = session_manager.get_active_mut() {
+                if let Some(agentic) = &mut session.agentic {
+                    agentic.compact_intent =
+                        Some(crate::session::CompactIntent::ProceedAfterStreamEnd);
+                }
+            }
+            result.map_or(
+                UiActionResult::Handled,
+                UiActionResult::PublishPermissionResponse,
+            )
+        }
+        DaveAction::Compact => UiActionResult::Compact,
+        // All run actions are intercepted and handled in lib.rs before reaching here
+        DaveAction::Run(_) => UiActionResult::Handled,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dispatch_open_terminal;
+    use crate::config::AiMode;
+    use crate::session::SessionManager;
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn open_terminal_key_action_dispatches_active_session_cwd() {
+        let mut session_manager = SessionManager::new();
+        let expected_cwd = PathBuf::from("/tmp/terminal-cwd");
+        let session_id = session_manager.new_session(
+            expected_cwd.clone(),
+            AiMode::Agentic,
+            crate::backend::BackendType::Claude,
+        );
+        session_manager.switch_to(session_id);
+
+        let launched_cwd = RefCell::new(None::<PathBuf>);
+        dispatch_open_terminal(&session_manager, |cwd: &Path| {
+            launched_cwd.replace(Some(cwd.to_path_buf()));
+        });
+
+        assert_eq!(launched_cwd.into_inner(), Some(expected_cwd));
+    }
+
+    #[test]
+    fn open_terminal_key_action_ignores_remote_sessions() {
+        let mut session_manager = SessionManager::new();
+        let session_id = session_manager.new_session(
+            PathBuf::from("/tmp/remote-cwd"),
+            AiMode::Agentic,
+            crate::backend::BackendType::Claude,
+        );
+        let session = session_manager
+            .get_mut(session_id)
+            .expect("remote test session should exist");
+        session.source = crate::session::SessionSource::Remote;
+        session_manager.switch_to(session_id);
+
+        let launched_cwd = RefCell::new(None::<PathBuf>);
+        dispatch_open_terminal(&session_manager, |cwd: &Path| {
+            launched_cwd.replace(Some(cwd.to_path_buf()));
+        });
+
+        assert!(launched_cwd.into_inner().is_none());
     }
 }

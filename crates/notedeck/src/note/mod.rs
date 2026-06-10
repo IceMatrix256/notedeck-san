@@ -5,18 +5,19 @@ pub mod publish;
 pub use action::{NoteAction, ReactAction, ScrollInfo, ZapAction, ZapTargetAmount};
 pub use context::{BroadcastContext, ContextSelection, NoteContextSelection};
 pub use publish::{
-    builder_from_note, send_mute_event, send_note_builder, send_report_event, send_unmute_event,
-    ReportTarget, ReportType,
+    builder_from_note, construct_people_list_note, send_mute_event, send_people_list_event,
+    send_report_event, send_unmute_event, ReportTarget, ReportType,
 };
 
 use crate::jobs::MediaJobSender;
 use crate::nip05::Nip05Cache;
+use crate::sound::SoundManager;
 use crate::Accounts;
 use crate::GlobalWallet;
 use crate::Localization;
 use crate::UnknownIds;
 use crate::{notecache::NoteCache, zaps::Zaps, Images};
-use enostr::{NoteId, RelayPool};
+use enostr::NoteId;
 use nostrdb::{Ndb, Note, NoteKey, QueryResult, Transaction};
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -32,11 +33,11 @@ pub struct NoteContext<'d> {
     pub img_cache: &'d mut Images,
     pub note_cache: &'d mut NoteCache,
     pub zaps: &'d mut Zaps,
-    pub pool: &'d mut RelayPool,
     pub jobs: &'d MediaJobSender,
     pub unknown_ids: &'d mut UnknownIds,
     pub nip05_cache: &'d mut Nip05Cache,
     pub clipboard: &'d mut egui_winit::clipboard::Clipboard,
+    pub sound: &'d SoundManager,
 }
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone, Hash)]

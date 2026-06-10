@@ -1,5 +1,6 @@
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
+use std::path::Path;
 
 /// Represents a proposed file modification from an AI tool call
 #[derive(Debug, Clone)]
@@ -19,6 +20,8 @@ pub enum FileUpdateType {
     },
     /// Write: create/overwrite entire file
     Write { content: String },
+    /// Unified diff from an external tool (e.g. Codex)
+    UnifiedDiff { diff: String },
 }
 
 /// A single line in a diff
@@ -43,6 +46,20 @@ impl From<ChangeTag> for DiffTag {
             ChangeTag::Insert => DiffTag::Insert,
         }
     }
+}
+
+/// Result of expanding diff context by reading the actual file from disk.
+pub struct ExpandedDiffContext {
+    /// Extra Equal lines loaded above the diff
+    pub above: Vec<DiffLine>,
+    /// Extra Equal lines loaded below the diff
+    pub below: Vec<DiffLine>,
+    /// 1-based line number in the file where the first displayed line starts
+    pub start_line: usize,
+    /// Whether there are more lines above that could be loaded
+    pub has_more_above: bool,
+    /// Whether there are more lines below that could be loaded
+    pub has_more_below: bool,
 }
 
 impl FileUpdate {
@@ -117,8 +134,67 @@ impl FileUpdate {
                 }
                 deleted_lines <= max_lines && inserted_lines <= max_lines
             }
-            FileUpdateType::Write { .. } => false,
+            FileUpdateType::Write { .. } | FileUpdateType::UnifiedDiff { .. } => false,
         }
+    }
+
+    /// Read the file from disk and expand context around the edit.
+    ///
+    /// Returns `None` if this is not an Edit, the file can't be read,
+    /// or `old_string` can't be found in the file.
+    pub fn expanded_context(
+        &self,
+        extra_above: usize,
+        extra_below: usize,
+    ) -> Option<ExpandedDiffContext> {
+        let FileUpdateType::Edit { old_string, .. } = &self.update_type else {
+            return None;
+        };
+
+        let file_content = std::fs::read_to_string(Path::new(&self.file_path)).ok()?;
+
+        // Find where old_string appears in the file
+        let byte_offset = file_content.find(old_string.as_str())?;
+
+        // Count newlines before the match to get 0-based start line index
+        let start_idx = file_content[..byte_offset]
+            .chars()
+            .filter(|&c| c == '\n')
+            .count();
+
+        let file_lines: Vec<&str> = file_content.lines().collect();
+        let total_lines = file_lines.len();
+
+        let old_line_count = old_string.lines().count();
+        let end_idx = start_idx + old_line_count; // exclusive, 0-based
+
+        // Extra lines above
+        let above_start = start_idx.saturating_sub(extra_above);
+        let above: Vec<DiffLine> = file_lines[above_start..start_idx]
+            .iter()
+            .map(|line| DiffLine {
+                tag: DiffTag::Equal,
+                content: format!("{}\n", line),
+            })
+            .collect();
+
+        // Extra lines below
+        let below_end = (end_idx + extra_below).min(total_lines);
+        let below: Vec<DiffLine> = file_lines[end_idx..below_end]
+            .iter()
+            .map(|line| DiffLine {
+                tag: DiffTag::Equal,
+                content: format!("{}\n", line),
+            })
+            .collect();
+
+        Some(ExpandedDiffContext {
+            start_line: above_start + 1, // 1-based
+            has_more_above: above_start > 0,
+            has_more_below: below_end < total_lines,
+            above,
+            below,
+        })
     }
 
     /// Compute the diff lines for an update type (internal helper)
@@ -143,6 +219,37 @@ impl FileUpdate {
                     .map(|line| DiffLine {
                         tag: DiffTag::Insert,
                         content: format!("{}\n", line),
+                    })
+                    .collect()
+            }
+            FileUpdateType::UnifiedDiff { diff } => {
+                // Parse unified diff format: lines starting with '+'/'-'/' '
+                // Skip header lines (---/+++/@@ lines)
+                diff.lines()
+                    .filter(|line| {
+                        !line.starts_with("---")
+                            && !line.starts_with("+++")
+                            && !line.starts_with("@@")
+                    })
+                    .map(|line| {
+                        if let Some(rest) = line.strip_prefix('+') {
+                            DiffLine {
+                                tag: DiffTag::Insert,
+                                content: format!("{}\n", rest),
+                            }
+                        } else if let Some(rest) = line.strip_prefix('-') {
+                            DiffLine {
+                                tag: DiffTag::Delete,
+                                content: format!("{}\n", rest),
+                            }
+                        } else {
+                            // Context line (starts with ' ' or is bare)
+                            let content = line.strip_prefix(' ').unwrap_or(line);
+                            DiffLine {
+                                tag: DiffTag::Equal,
+                                content: format!("{}\n", content),
+                            }
+                        }
                     })
                     .collect()
             }
@@ -334,6 +441,94 @@ mod tests {
             update.is_small_edit(2),
             "Single-line change should be small"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // UnifiedDiff tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unified_diff_basic() {
+        let update = FileUpdate::new(
+            "test.rs".to_string(),
+            FileUpdateType::UnifiedDiff {
+                diff: "--- a/test.rs\n+++ b/test.rs\n@@ -1,3 +1,3 @@\n context\n-old line\n+new line\n more context\n"
+                    .to_string(),
+            },
+        );
+        let lines = FileUpdate::compute_diff_for(&update.update_type);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0].tag, DiffTag::Equal);
+        assert_eq!(lines[0].content, "context\n");
+        assert_eq!(lines[1].tag, DiffTag::Delete);
+        assert_eq!(lines[1].content, "old line\n");
+        assert_eq!(lines[2].tag, DiffTag::Insert);
+        assert_eq!(lines[2].content, "new line\n");
+        assert_eq!(lines[3].tag, DiffTag::Equal);
+        assert_eq!(lines[3].content, "more context\n");
+    }
+
+    #[test]
+    fn test_unified_diff_skips_headers() {
+        let update = FileUpdate::new(
+            "test.rs".to_string(),
+            FileUpdateType::UnifiedDiff {
+                diff: "--- a/old.rs\n+++ b/new.rs\n@@ -10,4 +10,4 @@\n+added\n".to_string(),
+            },
+        );
+        let lines = FileUpdate::compute_diff_for(&update.update_type);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].tag, DiffTag::Insert);
+        assert_eq!(lines[0].content, "added\n");
+    }
+
+    #[test]
+    fn test_unified_diff_delete_only() {
+        let update = FileUpdate::new(
+            "test.rs".to_string(),
+            FileUpdateType::UnifiedDiff {
+                diff: "-removed line 1\n-removed line 2\n".to_string(),
+            },
+        );
+        let lines = FileUpdate::compute_diff_for(&update.update_type);
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|l| l.tag == DiffTag::Delete));
+    }
+
+    #[test]
+    fn test_unified_diff_insert_only() {
+        let update = FileUpdate::new(
+            "test.rs".to_string(),
+            FileUpdateType::UnifiedDiff {
+                diff: "+new line 1\n+new line 2\n+new line 3\n".to_string(),
+            },
+        );
+        let lines = FileUpdate::compute_diff_for(&update.update_type);
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|l| l.tag == DiffTag::Insert));
+    }
+
+    #[test]
+    fn test_unified_diff_empty() {
+        let update = FileUpdate::new(
+            "test.rs".to_string(),
+            FileUpdateType::UnifiedDiff {
+                diff: String::new(),
+            },
+        );
+        let lines = FileUpdate::compute_diff_for(&update.update_type);
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_unified_diff_is_never_small_edit() {
+        let update = FileUpdate::new(
+            "test.rs".to_string(),
+            FileUpdateType::UnifiedDiff {
+                diff: "+x\n".to_string(),
+            },
+        );
+        assert!(!update.is_small_edit(100));
     }
 
     #[test]

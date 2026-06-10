@@ -20,9 +20,11 @@ notedeck_ui = { workspace = true }
 notedeck_dave = { workspace = true }
 notedeck_messages = { workspace = true, optional = true }
 notedeck_notebook = { workspace = true, optional = true }
+notedeck_nostrverse = { workspace = true, optional = true }
 notedeck_clndash = { workspace = true, optional = true }
 notedeck_dashboard = { workspace = true, optional = true }
-notedeck = { workspace = true }
+notedeck_wasm = { workspace = true, optional = true }
+notedeck = { workspace = true, features = ["sound"] }
 nostrdb = { workspace = true }
 puffin = { workspace = true, optional = true }
 puffin_egui = { workspace = true, optional = true }
@@ -38,6 +40,8 @@ re_memory = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+egui_kittest = { workspace = true, features = ["snapshot", "wgpu"] }
+notedeck = { workspace = true, features = ["snapshot-testing", "auto-update"] }
 
 [lib]
 crate-type = ["lib", "cdylib"]
@@ -52,13 +56,17 @@ path = "src/notedeck.rs"
 
 [features]
 default = []
+auto-update = ["notedeck/auto-update"]
+snapshot-testing = ["notedeck/snapshot-testing"]
 memory = ["re_memory"]
 puffin = ["profiling/profile-with-puffin", "dep:puffin"]
 tracy = ["profiling/profile-with-tracy"]
 messages = ["notedeck_messages"]
 notebook = ["notedeck_notebook"]
+nostrverse = ["notedeck_nostrverse"]
 clndash = ["notedeck_clndash"]
 dashboard = ["notedeck_dashboard"]
+wasm = ["notedeck_wasm"]
 
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-logcat = "0.1.0"

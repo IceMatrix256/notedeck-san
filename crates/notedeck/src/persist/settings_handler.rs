@@ -15,10 +15,6 @@ const DEFAULT_ZOOM_FACTOR: f32 = 1.0;
 const DEFAULT_SHOW_SOURCE_CLIENT: &str = "hide";
 const DEFAULT_SHOW_REPLIES_NEWEST_FIRST: bool = false;
 const DEFAULT_TOS_VERSION: &str = "1.0";
-#[cfg(any(target_os = "android", target_os = "ios"))]
-pub const DEFAULT_NOTE_BODY_FONT_SIZE: f32 = 13.0;
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub const DEFAULT_NOTE_BODY_FONT_SIZE: f32 = 16.0;
 pub const DEFAULT_MAX_HASHTAGS_PER_NOTE: usize = 3;
 
 fn deserialize_theme(serialized_theme: &str) -> Option<ThemePreference> {
@@ -37,7 +33,6 @@ pub struct Settings {
     pub zoom_factor: f32,
     pub show_source_client: String,
     pub show_replies_newest_first: bool,
-    pub note_body_font_size: f32,
     #[serde(default = "default_animate_nav_transitions")]
     pub animate_nav_transitions: bool,
     pub max_hashtags_per_note: usize,
@@ -51,10 +46,30 @@ pub struct Settings {
     pub tos_version: String,
     #[serde(default)]
     pub age_verified: bool,
+    #[serde(default = "default_sounds_enabled")]
+    pub sounds_enabled: bool,
+    #[serde(default = "default_sound_volume")]
+    pub sound_volume: f32,
+    #[serde(default = "default_release_channel")]
+    pub release_channel: String,
+}
+
+const DEFAULT_RELEASE_CHANNEL: &str = "main";
+
+fn default_release_channel() -> String {
+    DEFAULT_RELEASE_CHANNEL.to_string()
 }
 
 fn default_animate_nav_transitions() -> bool {
     true
+}
+
+fn default_sounds_enabled() -> bool {
+    true
+}
+
+fn default_sound_volume() -> f32 {
+    0.5
 }
 
 fn default_tos_version() -> String {
@@ -69,7 +84,6 @@ impl Default for Settings {
             zoom_factor: DEFAULT_ZOOM_FACTOR,
             show_source_client: DEFAULT_SHOW_SOURCE_CLIENT.to_string(),
             show_replies_newest_first: DEFAULT_SHOW_REPLIES_NEWEST_FIRST,
-            note_body_font_size: DEFAULT_NOTE_BODY_FONT_SIZE,
             animate_nav_transitions: default_animate_nav_transitions(),
             max_hashtags_per_note: DEFAULT_MAX_HASHTAGS_PER_NOTE,
             welcome_completed: false,
@@ -77,6 +91,9 @@ impl Default for Settings {
             tos_accepted_at: None,
             tos_version: default_tos_version(),
             age_verified: false,
+            sounds_enabled: default_sounds_enabled(),
+            sound_volume: default_sound_volume(),
+            release_channel: default_release_channel(),
         }
     }
 }
@@ -216,11 +233,6 @@ impl SettingsHandler {
         self.try_save_settings();
     }
 
-    pub fn set_note_body_font_size(&mut self, value: f32) {
-        self.get_settings_mut().note_body_font_size = value;
-        self.try_save_settings();
-    }
-
     pub fn set_animate_nav_transitions(&mut self, value: bool) {
         self.get_settings_mut().animate_nav_transitions = value;
         self.try_save_settings();
@@ -231,6 +243,17 @@ impl SettingsHandler {
         self.try_save_settings();
     }
 
+    pub fn set_sounds_enabled(&mut self, value: bool) {
+        self.get_settings_mut().sounds_enabled = value;
+        self.try_save_settings();
+    }
+
+    pub fn set_sound_volume(&mut self, value: f32) {
+        self.get_settings_mut().sound_volume = value;
+        self.try_save_settings();
+    }
+
+    #[profiling::function]
     pub fn update_batch<F>(&mut self, update_fn: F)
     where
         F: FnOnce(&mut Settings),
@@ -284,13 +307,6 @@ impl SettingsHandler {
         self.current_settings.is_some()
     }
 
-    pub fn note_body_font_size(&self) -> f32 {
-        self.current_settings
-            .as_ref()
-            .map(|s| s.note_body_font_size)
-            .unwrap_or(DEFAULT_NOTE_BODY_FONT_SIZE)
-    }
-
     pub fn max_hashtags_per_note(&self) -> usize {
         self.current_settings
             .as_ref()
@@ -315,6 +331,18 @@ impl SettingsHandler {
             .as_ref()
             .map(|s| s.tos_accepted)
             .unwrap_or(false)
+    }
+
+    pub fn release_channel(&self) -> &str {
+        self.current_settings
+            .as_ref()
+            .map(|s| s.release_channel.as_str())
+            .unwrap_or(DEFAULT_RELEASE_CHANNEL)
+    }
+
+    pub fn set_release_channel(&mut self, channel: &str) {
+        self.get_settings_mut().release_channel = channel.to_string();
+        self.try_save_settings();
     }
 
     pub fn accept_tos(&mut self) {

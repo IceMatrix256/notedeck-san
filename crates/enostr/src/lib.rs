@@ -18,8 +18,18 @@ pub use note::{Note, NoteId};
 pub use profile::ProfileState;
 pub use pubkey::{Pubkey, PubkeyRef};
 pub use relay::message::{RelayEvent, RelayMessage};
-pub use relay::pool::{PoolEvent, PoolEventBuf, PoolRelay, RelayPool};
-pub use relay::subs_debug::{OwnedRelayEvent, RelayLogEvent, SubsDebug, TransferStats};
-pub use relay::{Relay, RelayStatus};
+pub use relay::same_canonical_filter_set;
+pub use relay::{
+    EventChecker, FullHistoryConfig, FullHistorySubId, NegSetProvider, Nip11ApplyOutcome,
+    Nip11FetchRequest, Nip11LimitationsRaw, NormRelayUrl, OutboxPool, OutboxRecvBudget,
+    OutboxRecvResult, OutboxSession, OutboxSessionHandler, OutboxSubId, RelayCoordinatorLimits,
+    RelayId, RelayImplType, RelayLimitations, RelayReqId, RelayReqStatus, RelayRoutingPreference,
+    RelayStatus, RelayType, RelayUrlPkgs, SubPass, SubPassGuardian, SubPassRevocation,
+    WebsocketConn,
+};
 
 pub type Result<T> = std::result::Result<T, error::Error>;
+
+pub trait Wakeup: Send + Sync + Clone + 'static {
+    fn wake(&self);
+}

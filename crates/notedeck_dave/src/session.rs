@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
+use std::time::Instant;
 
 use crate::agent_status::AgentStatus;
+use crate::backend::BackendType;
 use crate::config::AiMode;
+use crate::focus_queue::FocusPriority;
 use crate::git_status::GitStatusCache;
 use crate::messages::{
     AnswerSummary, CompactionInfo, ExecutedTool, PermissionResponse, PermissionResponseType,
@@ -16,6 +19,26 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 pub type SessionId = u32;
+
+/// Convert PermissionMode to a stable string for nostr tags.
+pub fn permission_mode_to_str(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::Plan => "plan",
+        PermissionMode::AcceptEdits => "accept_edits",
+        PermissionMode::BypassPermissions => "bypass",
+    }
+}
+
+/// Parse PermissionMode from a nostr tag string.
+pub fn permission_mode_from_str(s: &str) -> PermissionMode {
+    match s {
+        "plan" => PermissionMode::Plan,
+        "accept_edits" => PermissionMode::AcceptEdits,
+        "bypass" => PermissionMode::BypassPermissions,
+        _ => PermissionMode::Default,
+    }
+}
 
 /// Whether this session runs locally or is observed remotely via relays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -30,11 +53,98 @@ pub enum SessionSource {
 /// Session metadata for display in chat headers
 pub struct SessionDetails {
     pub title: String,
+    /// User-set title that takes precedence over the auto-generated one.
+    pub custom_title: Option<String>,
     pub hostname: String,
     pub cwd: Option<PathBuf>,
     /// Home directory of the machine where this session originated.
     /// Used to abbreviate cwd paths for remote sessions.
     pub home_dir: String,
+    /// User-requested model override for new backend requests and clones.
+    ///
+    /// `None` means "let the backend choose its default model".
+    pub requested_model: Option<String>,
+    /// Model currently reported by the backend for display.
+    ///
+    /// This may differ from `requested_model` if the backend resolved an alias
+    /// to a concrete version or fell back to a different model.
+    pub model: Option<String>,
+}
+
+impl SessionDetails {
+    /// Returns custom_title if set, otherwise the auto-generated title.
+    pub fn display_title(&self) -> &str {
+        self.custom_title.as_deref().unwrap_or(&self.title)
+    }
+
+    /// Returns a human-friendly model name for display.
+    ///
+    /// Converts raw model IDs like "claude-opus-4-6-20250514" to "Opus 4.6",
+    /// "gpt-5.2-codex" to "GPT-5.2 Codex", etc.
+    pub fn display_model(&self) -> Option<&str> {
+        self.model.as_deref().map(friendly_model_name)
+    }
+
+    /// Resolve the model to use for an API request.
+    ///
+    /// Returns the user-selected model if set, otherwise `None` to let
+    /// the backend use its own default.
+    pub fn resolve_model(&self) -> Option<String> {
+        self.requested_model.clone()
+    }
+}
+
+/// Table mapping model ID prefixes to human-friendly display names.
+///
+/// Entries are checked in order; the first matching prefix wins.
+/// If no prefix matches, the raw model ID is returned as-is.
+const MODEL_DISPLAY_NAMES: &[(&str, &str)] = &[
+    // Claude Opus
+    ("claude-opus-4-6", "Opus 4.6"),
+    ("claude-opus-4-5", "Opus 4.5"),
+    ("claude-opus-4", "Opus 4"),
+    // Claude Sonnet
+    ("claude-sonnet-4-6", "Sonnet 4.6"),
+    ("claude-sonnet-4-5", "Sonnet 4.5"),
+    ("claude-sonnet-4.5", "Sonnet 4.5"),
+    ("claude-sonnet-4", "Sonnet 4"),
+    ("claude-3-5-sonnet", "Sonnet 3.5"),
+    ("claude-3-sonnet", "Sonnet 3"),
+    // Claude Haiku
+    ("claude-haiku-4-5", "Haiku 4.5"),
+    ("claude-3-5-haiku", "Haiku 3.5"),
+    ("claude-3-haiku", "Haiku 3"),
+];
+
+/// Convert a raw model ID to a human-friendly display name.
+///
+/// Falls back to the raw ID if no known prefix matches.
+pub fn friendly_model_name(model: &str) -> &str {
+    for &(prefix, display) in MODEL_DISPLAY_NAMES {
+        if model.starts_with(prefix) {
+            return display;
+        }
+    }
+    model
+}
+
+/// Unified compaction intent — replaces the old `CompactAndProceedState`
+/// enum *and* the separate `is_compacting: bool` field.
+///
+/// `None` = idle (no compaction in progress, no compact-and-proceed pending).
+/// Each variant captures exactly one phase of the compaction lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CompactIntent {
+    /// Manual compact (Compact button pressed); no "Proceed" afterwards.
+    Manual,
+    /// "Compact & Approve" clicked; waiting for the current stream to end
+    /// so we can dispatch the compact query.
+    ProceedAfterStreamEnd,
+    /// Compact query dispatched; waiting for CompactionComplete.
+    ProceedAfterCompaction,
+    /// Compaction finished; send "Proceed" at next opportunity
+    /// (stream-end for local, immediately for remote).
+    ReadyToProceed,
 }
 
 /// State for permission response with message
@@ -58,8 +168,8 @@ pub struct PermissionTracker {
     pub pending: HashMap<Uuid, oneshot::Sender<PermissionResponse>>,
     /// Maps permission-request UUID → nostr note ID of the published request.
     pub request_note_ids: HashMap<Uuid, [u8; 32]>,
-    /// Permission UUIDs that have already been responded to.
-    pub responded: HashSet<Uuid>,
+    /// Permission UUIDs that have already been responded to, with the decision.
+    pub responded: HashMap<Uuid, PermissionResponseType>,
 }
 
 impl PermissionTracker {
@@ -67,7 +177,7 @@ impl PermissionTracker {
         Self {
             pending: HashMap::new(),
             request_note_ids: HashMap::new(),
-            responded: HashSet::new(),
+            responded: HashMap::new(),
         }
     }
 
@@ -103,7 +213,7 @@ impl PermissionTracker {
 
         // 2. Update PermissionTracker state
         if is_remote {
-            self.responded.insert(request_id);
+            self.responded.insert(request_id, response_type);
         } else if let Some(response) = oneshot_response {
             if let Some(sender) = self.pending.remove(&request_id) {
                 if sender.send(response).is_err() {
@@ -121,7 +231,7 @@ impl PermissionTracker {
     /// Merge loaded permission state from restored events.
     pub fn merge_loaded(
         &mut self,
-        responded: HashSet<Uuid>,
+        responded: HashMap<Uuid, PermissionResponseType>,
         request_note_ids: HashMap<Uuid, [u8; 32]>,
     ) {
         self.responded = responded;
@@ -155,8 +265,8 @@ pub struct AgenticSessionData {
     pub session_info: Option<SessionInfo>,
     /// Indices of subagent messages in chat (keyed by task_id)
     pub subagent_indices: HashMap<String, usize>,
-    /// Whether conversation compaction is in progress
-    pub is_compacting: bool,
+    /// Compaction lifecycle state. `None` = idle.
+    pub compact_intent: Option<CompactIntent>,
     /// Info from the last completed compaction (for display)
     pub last_compaction: Option<CompactionInfo>,
     /// Claude session ID to resume (UUID from Claude CLI's session storage)
@@ -166,9 +276,9 @@ pub struct AgenticSessionData {
     pub git_status: GitStatusCache,
     /// Threading state for live kind-1988 event generation.
     pub live_threading: ThreadingState,
-    /// Subscription for remote permission response events (kind-1988, t=ai-permission).
+    /// Subscription for remote kind-1988 events (permission responses, commands).
     /// Set up once when the session's claude_session_id becomes known.
-    pub perm_response_sub: Option<nostrdb::Subscription>,
+    pub conversation_action_sub: Option<nostrdb::Subscription>,
     /// Status as reported by the remote desktop's kind-31988 event.
     /// Only meaningful when session source is Remote.
     pub remote_status: Option<AgentStatus>,
@@ -182,6 +292,16 @@ pub struct AgenticSessionData {
     /// Prevents duplicate messages when events are loaded during restore
     /// and then appear again via the subscription.
     pub seen_note_ids: HashSet<[u8; 32]>,
+    /// Accumulated usage metrics across queries in this session.
+    pub usage: crate::messages::UsageInfo,
+    /// Runtime allowlist for auto-accepting permissions this session.
+    /// For Bash: stores binary names (first word of command).
+    /// For other tools: stores the tool name.
+    pub runtime_allows: HashSet<String>,
+    /// Stable Nostr event identity for this session (d-tag for kind-31988
+    /// and kind-1988 events).  Generated at creation, never changes.
+    /// Separate from the Claude CLI session ID used for `--resume`.
+    pub event_id: String,
 }
 
 impl AgenticSessionData {
@@ -204,23 +324,79 @@ impl AgenticSessionData {
             cwd,
             session_info: None,
             subagent_indices: HashMap::new(),
-            is_compacting: false,
+            compact_intent: None,
             last_compaction: None,
             resume_session_id: None,
             git_status,
             live_threading: ThreadingState::new(),
-            perm_response_sub: None,
+            conversation_action_sub: None,
             remote_status: None,
             remote_status_ts: 0,
             live_conversation_sub: None,
             seen_note_ids: HashSet::new(),
+            usage: Default::default(),
+            runtime_allows: HashSet::new(),
+            event_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 
-    /// Get the session ID to use for live kind-1988 events.
+    /// Extract the runtime allow key from a permission request.
+    /// For Bash: first word of the command (binary name).
+    /// For other tools: the tool name itself.
+    fn runtime_allow_key(tool_name: &str, tool_input: &serde_json::Value) -> Option<String> {
+        if tool_name == "Bash" {
+            tool_input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .and_then(|cmd| cmd.split_whitespace().next())
+                .map(|s| s.to_string())
+        } else {
+            Some(tool_name.to_string())
+        }
+    }
+
+    /// Check if a permission request matches the runtime allowlist.
+    pub fn should_runtime_allow(&self, tool_name: &str, tool_input: &serde_json::Value) -> bool {
+        if let Some(key) = Self::runtime_allow_key(tool_name, tool_input) {
+            self.runtime_allows.contains(&key)
+        } else {
+            false
+        }
+    }
+
+    /// Add a runtime allow rule from a permission request.
+    /// Returns the key that was added (for logging).
+    pub fn add_runtime_allow(
+        &mut self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+    ) -> Option<String> {
+        let key = Self::runtime_allow_key(tool_name, tool_input)?;
+        self.runtime_allows.insert(key.clone());
+        Some(key)
+    }
+
+    /// Stable Nostr event identity (d-tag for kind-1988 / kind-31988).
     ///
-    /// Prefers claude_session_id from SessionInfo, falls back to resume_session_id.
-    pub fn event_session_id(&self) -> Option<&str> {
+    /// This is always available — every session gets a UUID at creation.
+    /// It is independent of the Claude CLI session ID.
+    pub fn event_session_id(&self) -> &str {
+        &self.event_id
+    }
+
+    /// Whether a compaction operation is currently in-flight.
+    pub fn is_compacting(&self) -> bool {
+        matches!(
+            self.compact_intent,
+            Some(CompactIntent::Manual | CompactIntent::ProceedAfterCompaction)
+        )
+    }
+
+    /// Get the CLI session ID for backend `--resume`.
+    ///
+    /// Returns the real Claude CLI session ID.  `None` means the backend
+    /// hasn't started yet (no session to resume).
+    pub fn cli_resume_id(&self) -> Option<&str> {
         self.session_info
             .as_ref()
             .and_then(|i| i.claude_session_id.as_deref())
@@ -237,9 +413,13 @@ impl AgenticSessionData {
         if let Some(&idx) = self.subagent_indices.get(task_id) {
             if let Some(Message::Subagent(subagent)) = chat.get_mut(idx) {
                 subagent.output.push_str(new_output);
-                // Keep only the most recent content up to max_output_size
+                // Keep only the most recent content up to max_output_size.
+                // Must find a valid UTF-8 char boundary to avoid panics.
                 if subagent.output.len() > subagent.max_output_size {
-                    let keep_from = subagent.output.len() - subagent.max_output_size;
+                    let mut keep_from = subagent.output.len() - subagent.max_output_size;
+                    while !subagent.output.is_char_boundary(keep_from) {
+                        keep_from += 1;
+                    }
                     subagent.output = subagent.output[keep_from..].to_string();
                 }
             }
@@ -278,15 +458,64 @@ impl AgenticSessionData {
     }
 }
 
+/// Tracks the lifecycle of a dispatch to the AI backend.
+///
+/// Transitions:
+/// - `Idle → AwaitingResponse` when `send_user_message_for()` dispatches
+/// - `AwaitingResponse → Streaming` when the backend produces content
+/// - `Streaming | AwaitingResponse → Idle` at stream end
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum DispatchState {
+    /// No active dispatch.
+    #[default]
+    Idle,
+    /// Dispatched `count` trailing user messages; backend hasn't
+    /// produced visible content yet.
+    AwaitingResponse { count: usize },
+    /// Backend is actively producing content for this dispatch.
+    Streaming { dispatched_count: usize },
+}
+
+impl DispatchState {
+    /// Number of user messages that were dispatched in the current batch.
+    /// Used by `append_token` for insert position and UI for queued indicator.
+    pub fn dispatched_count(&self) -> usize {
+        match self {
+            DispatchState::Idle => 0,
+            DispatchState::AwaitingResponse { count } => *count,
+            DispatchState::Streaming { dispatched_count } => *dispatched_count,
+        }
+    }
+
+    /// Transition: backend produced content.
+    /// `AwaitingResponse → Streaming`; other states unchanged.
+    pub fn backend_responded(&mut self) {
+        if let DispatchState::AwaitingResponse { count } = *self {
+            *self = DispatchState::Streaming {
+                dispatched_count: count,
+            };
+        }
+    }
+
+    /// Transition: stream ended. Resets to `Idle`.
+    pub fn stream_ended(&mut self) {
+        *self = DispatchState::Idle;
+    }
+}
+
 /// A single chat session with Dave
 pub struct ChatSession {
     pub id: SessionId,
     pub chat: Vec<Message>,
     pub input: String,
+    /// Images staged for the next message send, cleared after dispatch.
+    pub pending_images: Vec<crate::messages::ImageAttachment>,
     pub incoming_tokens: Option<Receiver<DaveApiResponse>>,
     /// Handle to the background task processing this session's AI requests.
     /// Aborted on drop to clean up the subprocess.
     pub task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Tracks the dispatch lifecycle for redispatch and insert-position logic.
+    pub dispatch_state: DispatchState,
     /// Cached status for the agent (derived from session state)
     cached_status: AgentStatus,
     /// Set when cached_status changes, cleared after publishing state event
@@ -301,6 +530,24 @@ pub struct ChatSession {
     pub source: SessionSource,
     /// Session metadata for display (title, hostname, cwd)
     pub details: SessionDetails,
+    /// Which backend this session uses (Claude, Codex, etc.)
+    pub backend_type: BackendType,
+    /// When the last AI response token was received (for "5m ago" display)
+    pub last_activity: Option<Instant>,
+    /// When any backend message was last received (for stall detection).
+    /// Set when `incoming_tokens` is assigned, updated on every message.
+    pub last_backend_msg: Option<Instant>,
+    /// Focus indicator dot state (persisted in kind-31988 note).
+    /// Set on status transitions, cleared when user dismisses it.
+    pub indicator: Option<FocusPriority>,
+    /// When set, this session is a pending placeholder waiting for the remote
+    /// host to respond with a real kind-31988 session state event.
+    /// Cleared when matched to an incoming session event.
+    pub pending_created_at: Option<Instant>,
+    /// Spawn command UUID linking this session to the kind-31989 that created it.
+    /// Set on both the placeholder (sender) and the spawned session (receiver),
+    /// echoed in kind-31988 events so the sender can match the response.
+    pub spawn_id: Option<String>,
 }
 
 impl Drop for ChatSession {
@@ -312,7 +559,7 @@ impl Drop for ChatSession {
 }
 
 impl ChatSession {
-    pub fn new(id: SessionId, cwd: PathBuf, ai_mode: AiMode) -> Self {
+    pub fn new(id: SessionId, cwd: PathBuf, ai_mode: AiMode, backend_type: BackendType) -> Self {
         let details_cwd = if ai_mode == AiMode::Agentic {
             Some(cwd.clone())
         } else {
@@ -327,22 +574,33 @@ impl ChatSession {
             id,
             chat: vec![],
             input: String::new(),
+            pending_images: vec![],
             incoming_tokens: None,
             task_handle: None,
+            dispatch_state: DispatchState::Idle,
             cached_status: AgentStatus::Idle,
-            state_dirty: false,
+            state_dirty: true,
             focus_requested: false,
             ai_mode,
             agentic,
             source: SessionSource::Local,
             details: SessionDetails {
                 title: "New Chat".to_string(),
+                custom_title: None,
                 hostname: String::new(),
                 cwd: details_cwd,
                 home_dir: dirs::home_dir()
                     .map(|h| h.to_string_lossy().to_string())
                     .unwrap_or_default(),
+                requested_model: None,
+                model: None,
             },
+            backend_type,
+            last_activity: None,
+            last_backend_msg: None,
+            indicator: None,
+            pending_created_at: None,
+            spawn_id: None,
         }
     }
 
@@ -353,13 +611,58 @@ impl ChatSession {
         resume_session_id: String,
         title: String,
         ai_mode: AiMode,
+        backend_type: BackendType,
     ) -> Self {
-        let mut session = Self::new(id, cwd, ai_mode);
+        let mut session = Self::new(id, cwd, ai_mode, backend_type);
         if let Some(ref mut agentic) = session.agentic {
-            agentic.resume_session_id = Some(resume_session_id);
+            if !resume_session_id.is_empty() {
+                agentic.resume_session_id = Some(resume_session_id);
+            }
         }
         session.details.title = title;
         session
+    }
+
+    /// Create a lightweight pending placeholder for a remote spawn command.
+    /// Skips `AgenticSessionData` (no git status, no threading, no subscriptions)
+    /// since the placeholder only exists until the real session event arrives.
+    pub fn new_pending_placeholder(
+        id: SessionId,
+        cwd: PathBuf,
+        hostname: String,
+        backend_type: BackendType,
+        spawn_id: String,
+    ) -> Self {
+        ChatSession {
+            id,
+            chat: vec![],
+            input: String::new(),
+            incoming_tokens: None,
+            task_handle: None,
+            dispatch_state: DispatchState::Idle,
+            cached_status: AgentStatus::Pending,
+            state_dirty: false, // placeholder should not publish state events
+            focus_requested: false,
+            ai_mode: AiMode::Agentic,
+            agentic: None, // no agentic data — placeholder only
+            source: SessionSource::Remote,
+            details: SessionDetails {
+                title: "Connecting...".to_string(),
+                custom_title: None,
+                hostname,
+                cwd: Some(cwd),
+                home_dir: String::new(),
+                requested_model: None,
+                model: None,
+            },
+            backend_type,
+            last_activity: None,
+            last_backend_msg: None,
+            indicator: None,
+            pending_images: vec![],
+            pending_created_at: Some(Instant::now()),
+            spawn_id: Some(spawn_id),
+        }
     }
 
     // === Helper methods for accessing agentic data ===
@@ -388,14 +691,30 @@ impl ChatSession {
         self.source == SessionSource::Remote
     }
 
-    /// Check if session has pending permission requests
+    /// Check if session has pending permission requests that genuinely
+    /// need user input (i.e. would NOT be auto-accepted by the runtime
+    /// allowlist).
     pub fn has_pending_permissions(&self) -> bool {
         if self.is_remote() {
-            // Remote: check for unresponded PermissionRequest messages in chat
-            let responded = self.agentic.as_ref().map(|a| &a.permissions.responded);
+            // Remote: check for unresponded PermissionRequest messages in chat,
+            // but skip any that the runtime allowlist would auto-accept.
+            let agentic = self.agentic.as_ref();
+            let responded = agentic.map(|a| &a.permissions.responded);
             return self.chat.iter().any(|msg| {
                 if let Message::PermissionRequest(req) = msg {
-                    req.response.is_none() && responded.is_none_or(|ids| !ids.contains(&req.id))
+                    if req.response.is_some() {
+                        return false;
+                    }
+                    if responded.is_some_and(|ids| ids.contains_key(&req.id)) {
+                        return false;
+                    }
+                    // Skip if runtime allowlist would auto-accept
+                    if agentic
+                        .is_some_and(|a| a.should_runtime_allow(&req.tool_name, &req.tool_input))
+                    {
+                        return false;
+                    }
+                    true
                 } else {
                     false
                 }
@@ -407,11 +726,67 @@ impl ChatSession {
             .is_some_and(|a| a.permissions.has_pending())
     }
 
+    /// Auto-resolve any pending local permissions that now match the
+    /// runtime allowlist (e.g. after the user clicked "Allow Always"
+    /// and the allowlist was updated).  Returns the number resolved.
+    pub fn auto_resolve_runtime_allowed(&mut self) -> usize {
+        let Some(agentic) = &self.agentic else {
+            return 0;
+        };
+        if agentic.permissions.pending.is_empty() {
+            return 0;
+        }
+
+        // Collect IDs of pending permissions whose tool matches the allowlist
+        let to_resolve: Vec<uuid::Uuid> = self
+            .chat
+            .iter()
+            .filter_map(|msg| {
+                if let Message::PermissionRequest(req) = msg {
+                    if req.response.is_none()
+                        && agentic.permissions.pending.contains_key(&req.id)
+                        && agentic.should_runtime_allow(&req.tool_name, &req.tool_input)
+                    {
+                        return Some(req.id);
+                    }
+                }
+                None
+            })
+            .collect();
+
+        if to_resolve.is_empty() {
+            return 0;
+        }
+
+        // Resolve each: send Allow on the oneshot and mark in chat
+        let agentic = self.agentic.as_mut().unwrap();
+        for id in &to_resolve {
+            agentic.permissions.resolve(
+                &mut self.chat,
+                *id,
+                crate::messages::PermissionResponseType::Allowed,
+                None,
+                false,
+                Some(crate::messages::PermissionResponse::Allow { message: None }),
+            );
+        }
+
+        to_resolve.len()
+    }
+
     /// Check if session is in plan mode
     pub fn is_plan_mode(&self) -> bool {
         self.agentic
             .as_ref()
             .is_some_and(|a| a.permission_mode == PermissionMode::Plan)
+    }
+
+    /// Get the current permission mode (defaults to Default for non-agentic)
+    pub fn permission_mode(&self) -> PermissionMode {
+        self.agentic
+            .as_ref()
+            .map(|a| a.permission_mode)
+            .unwrap_or(PermissionMode::Default)
     }
 
     /// Get the working directory (agentic only)
@@ -447,7 +822,14 @@ impl ChatSession {
     pub fn update_title_from_last_message(&mut self) {
         for msg in self.chat.iter().rev() {
             let text: &str = match msg {
-                Message::User(text) => text,
+                Message::User(msg) => {
+                    let t = msg.as_str();
+                    if t.is_empty() && !msg.images.is_empty() {
+                        "[Image]"
+                    } else {
+                        t
+                    }
+                }
                 Message::Assistant(msg) => msg.text(),
                 _ => continue,
             };
@@ -473,16 +855,29 @@ impl ChatSession {
 
     /// Update the cached status based on current session state.
     /// Sets `state_dirty` when the status actually changes.
+    /// Also sets the focus indicator when transitioning to a notable state.
     pub fn update_status(&mut self) {
         let new_status = self.derive_status();
         if new_status != self.cached_status {
             self.cached_status = new_status;
+            if let Some(priority) = FocusPriority::from_status(new_status) {
+                // Set indicator when entering a notable state
+                self.indicator = Some(priority);
+            } else if self.indicator.is_some() {
+                // Clear stale indicator when agent resumes work
+                self.indicator = None;
+            }
             self.state_dirty = true;
         }
     }
 
     /// Derive status from the current session state
     fn derive_status(&self) -> AgentStatus {
+        // Pending placeholder sessions always show Pending
+        if self.pending_created_at.is_some() {
+            return AgentStatus::Pending;
+        }
+
         // Remote sessions derive status from the kind-31988 state event,
         // but override to NeedsInput if there are unresponded permission requests.
         if self.is_remote() {
@@ -548,6 +943,30 @@ pub struct SessionManager {
     next_id: SessionId,
     /// Pending external editor job (only one at a time)
     pub pending_editor: Option<EditorJob>,
+    /// Cached agent grouping: host → cwd → sessions.
+    /// Rebuilt via `rebuild_cwd_groups()` when sessions change.
+    host_cwd_groups: Vec<HostGroup>,
+    /// Whether host/cwd grouping cache must be rebuilt before reads.
+    host_cwd_groups_dirty: bool,
+    /// Cached chat session IDs in recency order.
+    chat_ids: Vec<SessionId>,
+    /// Whether chat ID cache must be rebuilt before reads.
+    chat_ids_dirty: bool,
+}
+
+/// A group of sessions under a single hostname.
+#[derive(Clone)]
+pub struct HostGroup {
+    pub hostname: String,
+    pub cwd_groups: Vec<CwdGroup>,
+}
+
+/// A group of sessions sharing a working directory.
+#[derive(Clone)]
+pub struct CwdGroup {
+    pub display_cwd: String,
+    pub cwd: PathBuf,
+    pub session_ids: Vec<SessionId>,
 }
 
 impl Default for SessionManager {
@@ -564,18 +983,28 @@ impl SessionManager {
             active: None,
             next_id: 1,
             pending_editor: None,
+            host_cwd_groups: Vec::new(),
+            host_cwd_groups_dirty: false,
+            chat_ids: Vec::new(),
+            chat_ids_dirty: false,
         }
     }
 
     /// Create a new session with the given cwd and make it active
-    pub fn new_session(&mut self, cwd: PathBuf, ai_mode: AiMode) -> SessionId {
+    pub fn new_session(
+        &mut self,
+        cwd: PathBuf,
+        ai_mode: AiMode,
+        backend_type: BackendType,
+    ) -> SessionId {
         let id = self.next_id;
         self.next_id += 1;
 
-        let session = ChatSession::new(id, cwd, ai_mode);
+        let session = ChatSession::new(id, cwd, ai_mode, backend_type);
         self.sessions.insert(id, session);
         self.order.insert(0, id); // Most recent first
         self.active = Some(id);
+        self.rebuild_cwd_groups();
 
         id
     }
@@ -587,14 +1016,38 @@ impl SessionManager {
         resume_session_id: String,
         title: String,
         ai_mode: AiMode,
+        backend_type: BackendType,
     ) -> SessionId {
         let id = self.next_id;
         self.next_id += 1;
 
-        let session = ChatSession::new_resumed(id, cwd, resume_session_id, title, ai_mode);
+        let session =
+            ChatSession::new_resumed(id, cwd, resume_session_id, title, ai_mode, backend_type);
         self.sessions.insert(id, session);
         self.order.insert(0, id); // Most recent first
         self.active = Some(id);
+        self.rebuild_cwd_groups();
+
+        id
+    }
+
+    /// Create a lightweight pending placeholder session for a remote spawn.
+    pub fn new_pending_placeholder(
+        &mut self,
+        cwd: PathBuf,
+        hostname: String,
+        backend_type: BackendType,
+        spawn_id: String,
+    ) -> SessionId {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let session =
+            ChatSession::new_pending_placeholder(id, cwd, hostname, backend_type, spawn_id);
+        self.sessions.insert(id, session);
+        self.order.insert(0, id);
+        self.active = Some(id);
+        self.rebuild_cwd_groups();
 
         id
     }
@@ -606,6 +1059,7 @@ impl SessionManager {
 
     /// Get a mutable reference to the active session
     pub fn get_active_mut(&mut self) -> Option<&mut ChatSession> {
+        self.mark_grouping_cache_dirty();
         self.active.and_then(|id| self.sessions.get_mut(&id))
     }
 
@@ -636,6 +1090,7 @@ impl SessionManager {
             if self.active == Some(id) {
                 self.active = self.order.first().copied();
             }
+            self.rebuild_cwd_groups();
             true
         } else {
             false
@@ -655,6 +1110,7 @@ impl SessionManager {
         if self.sessions.contains_key(&id) {
             self.order.retain(|&x| x != id);
             self.order.insert(0, id);
+            self.mark_grouping_cache_dirty();
         }
     }
 
@@ -675,6 +1131,7 @@ impl SessionManager {
 
     /// Get a mutable reference to a session by ID
     pub fn get_mut(&mut self, id: SessionId) -> Option<&mut ChatSession> {
+        self.mark_grouping_cache_dirty();
         self.sessions.get_mut(&id)
     }
 
@@ -685,12 +1142,17 @@ impl SessionManager {
 
     /// Iterate over all sessions mutably
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut ChatSession> {
+        self.mark_grouping_cache_dirty();
         self.sessions.values_mut()
     }
 
-    /// Update status for all sessions
+    /// Update status for all sessions.
+    ///
+    /// First drains any pending permissions that now match the runtime
+    /// allowlist (e.g. after "Allow Always"), then derives status.
     pub fn update_all_statuses(&mut self) {
         for session in self.sessions.values_mut() {
+            session.auto_resolve_runtime_allowed();
             session.update_status();
         }
     }
@@ -709,12 +1171,275 @@ impl SessionManager {
     pub fn session_ids(&self) -> Vec<SessionId> {
         self.order.clone()
     }
+
+    /// Get cached agent session groups: host → cwd → sessions.
+    pub fn host_cwd_groups(&mut self) -> &[HostGroup] {
+        self.ensure_grouping_cache();
+        &self.host_cwd_groups
+    }
+
+    /// Collect unique remote hostnames from all sessions.
+    pub fn remote_hostnames(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = self
+            .sessions
+            .values()
+            .filter(|session| session.is_remote())
+            .map(|session| session.details.hostname.clone())
+            .filter(|hostname| !hostname.is_empty())
+            .collect();
+        hosts.sort_unstable();
+        hosts.dedup();
+        hosts
+    }
+
+    /// Get cached chat session IDs in recency order.
+    pub fn chat_ids(&mut self) -> &[SessionId] {
+        self.ensure_grouping_cache();
+        &self.chat_ids
+    }
+
+    /// Session IDs in visual/display order (host/cwd groups then chats),
+    /// filtered by collapse state. Collapsed host/cwd groups are excluded.
+    pub fn visual_order(
+        &mut self,
+        collapse: &crate::collapse_state::CollapseState,
+    ) -> Vec<SessionId> {
+        self.ensure_grouping_cache();
+        let mut ids = Vec::new();
+        for host_group in &self.host_cwd_groups {
+            if collapse.is_host_collapsed(&host_group.hostname) {
+                continue;
+            }
+            for cwd_group in &host_group.cwd_groups {
+                // Single-session cwds render without a folder header (no UI to
+                // collapse), so they're always visible to keyboard nav too —
+                // ignore any stale `is_cwd_collapsed` state.
+                let collapsible = cwd_group.session_ids.len() > 1;
+                if collapsible && collapse.is_cwd_collapsed(&host_group.hostname, &cwd_group.cwd) {
+                    continue;
+                }
+                ids.extend_from_slice(&cwd_group.session_ids);
+            }
+        }
+        ids.extend_from_slice(&self.chat_ids);
+        ids
+    }
+
+    /// Get a session's index in the recency-ordered list (for keyboard shortcuts).
+    pub fn session_index(&self, id: SessionId) -> Option<usize> {
+        self.order.iter().position(|&oid| oid == id)
+    }
+
+    /// Rebuild the cached host/cwd groups from current sessions.
+    /// Call after adding/removing sessions or changing a session's cwd.
+    pub fn rebuild_cwd_groups(&mut self) {
+        self.host_cwd_groups.clear();
+        self.chat_ids.clear();
+
+        for &id in &self.order {
+            if let Some(session) = self.sessions.get(&id) {
+                if session.ai_mode != AiMode::Agentic {
+                    if session.ai_mode == AiMode::Chat {
+                        self.chat_ids.push(id);
+                    }
+                    continue;
+                }
+
+                let hostname = session.details.hostname.clone();
+                let cwd = session.cwd().or(session.details.cwd.as_ref());
+                let raw_cwd = cwd.cloned().unwrap_or_default();
+                let cwd_display = match cwd {
+                    Some(cwd) => {
+                        let home = &session.details.home_dir;
+                        if home.is_empty() {
+                            crate::path_utils::abbreviate_path(cwd)
+                        } else {
+                            crate::path_utils::abbreviate_with_home(cwd, home)
+                        }
+                    }
+                    None => "(unknown)".to_string(),
+                };
+
+                // Find or create host group
+                let host_group = if let Some(hg) = self
+                    .host_cwd_groups
+                    .iter_mut()
+                    .find(|hg| hg.hostname == hostname)
+                {
+                    hg
+                } else {
+                    self.host_cwd_groups.push(HostGroup {
+                        hostname: hostname.clone(),
+                        cwd_groups: Vec::new(),
+                    });
+                    self.host_cwd_groups.last_mut().unwrap()
+                };
+
+                // Find or create cwd group within host
+                if let Some(cg) = host_group
+                    .cwd_groups
+                    .iter_mut()
+                    .find(|cg| cg.cwd == raw_cwd)
+                {
+                    cg.session_ids.push(id);
+                } else {
+                    host_group.cwd_groups.push(CwdGroup {
+                        display_cwd: cwd_display,
+                        cwd: raw_cwd,
+                        session_ids: vec![id],
+                    });
+                }
+            }
+        }
+
+        // Sort host groups alphabetically (empty hostname = local, sorts first)
+        self.host_cwd_groups
+            .sort_by(|a, b| a.hostname.cmp(&b.hostname));
+
+        // Sort cwd groups and sessions within each
+        for host_group in &mut self.host_cwd_groups {
+            host_group
+                .cwd_groups
+                .sort_by(|a, b| a.display_cwd.cmp(&b.display_cwd));
+
+            for cwd_group in &mut host_group.cwd_groups {
+                cwd_group.session_ids.sort_by(|a, b| {
+                    let title_a = self
+                        .sessions
+                        .get(a)
+                        .map(|s| s.details.display_title())
+                        .unwrap_or("");
+                    let title_b = self
+                        .sessions
+                        .get(b)
+                        .map(|s| s.details.display_title())
+                        .unwrap_or("");
+                    title_a.cmp(title_b).then(a.cmp(b))
+                });
+            }
+        }
+
+        self.host_cwd_groups_dirty = false;
+        self.chat_ids_dirty = false;
+    }
+
+    /// Mark cached grouping state dirty after mutable session access.
+    fn mark_grouping_cache_dirty(&mut self) {
+        self.host_cwd_groups_dirty = true;
+        self.chat_ids_dirty = true;
+    }
+
+    /// Ensure host/cwd and chat caches are rebuilt before read access.
+    fn ensure_grouping_cache(&mut self) {
+        if self.host_cwd_groups_dirty || self.chat_ids_dirty {
+            self.rebuild_cwd_groups();
+        }
+    }
 }
 
 impl ChatSession {
     /// Whether the session is actively streaming a response from the backend.
     pub fn is_streaming(&self) -> bool {
         self.incoming_tokens.is_some()
+    }
+
+    /// Whether a dispatch is active (message sent to backend, waiting for
+    /// or receiving response). This is more reliable than `is_streaming()`
+    /// because it covers the window between dispatch and first token arrival.
+    pub fn is_dispatched(&self) -> bool {
+        !matches!(self.dispatch_state, DispatchState::Idle)
+    }
+
+    /// Append a streaming token to the current assistant message.
+    ///
+    /// If the last message is an Assistant, append there. Otherwise
+    /// search backwards through only trailing User messages (queued
+    /// ones) for a still-streaming Assistant. If none is found,
+    /// create a new Assistant — inserted after the dispatched user
+    /// message but before any queued ones.
+    ///
+    /// We intentionally do NOT search past ToolCalls, ToolResponse,
+    /// or other non-User messages. When Claude sends text → tool
+    /// call → more text, the post-tool tokens must go into a NEW
+    /// Assistant so the tool call appears between the two text blocks.
+    pub fn append_token(&mut self, token: &str) {
+        // Content arrived — transition AwaitingResponse → Streaming.
+        self.dispatch_state.backend_responded();
+        self.last_activity = Some(Instant::now());
+
+        // Fast path: last message is the active assistant response
+        if let Some(Message::Assistant(msg)) = self.chat.last_mut() {
+            msg.push_token(token);
+            return;
+        }
+
+        // Slow path: look backwards through only trailing User messages.
+        // If we find a streaming Assistant just before them, append there.
+        let mut appended = false;
+        for m in self.chat.iter_mut().rev() {
+            match m {
+                Message::User(_) => continue, // skip queued user messages
+                Message::Assistant(msg) if msg.is_streaming() => {
+                    msg.push_token(token);
+                    appended = true;
+                    break;
+                }
+                _ => break, // stop at ToolCalls, ToolResponse, finalized Assistant, etc.
+            }
+        }
+
+        if !appended {
+            // No streaming assistant reachable — start a new one.
+            // Insert after the dispatched user messages but before
+            // any newly queued ones so the response appears in the
+            // right order and queued messages trigger redispatch.
+            let mut msg = crate::messages::AssistantMessage::new();
+            msg.push_token(token);
+
+            let trailing_start = self
+                .chat
+                .iter()
+                .rposition(|m| !matches!(m, Message::User(_)))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+
+            // Skip past the dispatched user messages (default 1 for
+            // single dispatch, more for batch redispatch)
+            let skip = self.dispatch_state.dispatched_count().max(1);
+            let insert_pos = (trailing_start + skip).min(self.chat.len());
+            self.chat.insert(insert_pos, Message::Assistant(msg));
+        }
+    }
+
+    /// Finalize the last assistant message (cache parsed markdown, etc).
+    ///
+    /// Searches backwards because queued user messages may appear after
+    /// the assistant response in the chat.
+    pub fn finalize_last_assistant(&mut self) {
+        for msg in self.chat.iter_mut().rev() {
+            if let Message::Assistant(assistant) = msg {
+                assistant.finalize();
+                return;
+            }
+        }
+    }
+
+    /// Get the text of the last assistant message.
+    ///
+    /// Searches backwards because queued user messages may appear after
+    /// the assistant response in the chat.
+    pub fn last_assistant_text(&self) -> Option<String> {
+        self.chat.iter().rev().find_map(|m| match m {
+            Message::Assistant(msg) => {
+                let text = msg.text().to_string();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            _ => None,
+        })
     }
 
     /// Whether the session has an unanswered user message at the end of the
@@ -724,29 +1449,108 @@ impl ChatSession {
     }
 
     /// Whether a newly arrived remote user message should be dispatched to
-    /// the backend right now. Returns false if the session is already
-    /// streaming — the message is already in chat and will be picked up
+    /// the backend right now. Returns false if a dispatch is already
+    /// active — the message is already in chat and will be picked up
     /// when the current stream finishes.
     pub fn should_dispatch_remote_message(&self) -> bool {
-        !self.is_streaming() && self.has_pending_user_message()
+        !self.is_dispatched() && self.has_pending_user_message()
+    }
+
+    /// Mark the current trailing user messages as dispatched to the backend.
+    /// Call this when starting a new stream for this session.
+    pub fn mark_dispatched(&mut self) {
+        let count = self.trailing_user_count();
+        self.dispatch_state = DispatchState::AwaitingResponse { count };
+    }
+
+    /// Count trailing user messages at the end of the chat.
+    pub fn trailing_user_count(&self) -> usize {
+        self.chat
+            .iter()
+            .rev()
+            .take_while(|m| matches!(m, Message::User(_)))
+            .count()
     }
 
     /// Whether the session needs a re-dispatch after a stream ends.
     /// This catches user messages that arrived while we were streaming.
+    ///
+    /// Uses `dispatch_state` to distinguish genuinely new messages from
+    /// messages that were already dispatched:
+    ///
+    /// - `Streaming`: backend responded, so any trailing user messages
+    ///   are genuinely new (queued during the response).
+    /// - `AwaitingResponse`: backend returned empty. Only redispatch if
+    ///   NEW messages arrived beyond what was dispatched (prevents the
+    ///   infinite loop on empty responses).
+    /// - `Idle`: nothing to redispatch.
     pub fn needs_redispatch_after_stream_end(&self) -> bool {
-        !self.is_streaming() && self.has_pending_user_message()
+        match self.dispatch_state {
+            DispatchState::Streaming { .. } => self.has_pending_user_message(),
+            DispatchState::AwaitingResponse { count } => self.trailing_user_count() > count,
+            DispatchState::Idle => false,
+        }
+    }
+
+    /// If "Compact & Approve" has reached ReadyToProceed, consume the state,
+    /// push a "Proceed" user message, and return true.
+    ///
+    /// Called from:
+    /// - Local sessions: at stream-end in process_events()
+    /// - Remote sessions: on compaction_complete in poll_remote_conversation_events()
+    pub fn take_compact_and_proceed(&mut self) -> bool {
+        let ready = self
+            .agentic
+            .as_ref()
+            .is_some_and(|a| a.compact_intent == Some(CompactIntent::ReadyToProceed));
+
+        if !ready {
+            return false;
+        }
+
+        self.agentic.as_mut().unwrap().compact_intent = None;
+        self.chat
+            .push(Message::User("Proceed with implementing the plan.".into()));
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendType;
+    use crate::collapse_state::CollapseState;
     use crate::config::AiMode;
     use crate::messages::AssistantMessage;
     use std::sync::mpsc;
 
     fn test_session() -> ChatSession {
-        ChatSession::new(1, PathBuf::from("/tmp"), AiMode::Agentic)
+        ChatSession::new(
+            1,
+            PathBuf::from("/tmp"),
+            AiMode::Agentic,
+            BackendType::Claude,
+        )
+    }
+
+    fn create_grouped_session(
+        mgr: &mut SessionManager,
+        hostname: &str,
+        cwd: &str,
+        title: &str,
+        ai_mode: AiMode,
+    ) -> SessionId {
+        let backend = match ai_mode {
+            AiMode::Agentic => BackendType::Claude,
+            AiMode::Chat => BackendType::OpenAI,
+        };
+        let id = mgr.new_session(PathBuf::from(cwd), ai_mode, backend);
+        let session = mgr.get_mut(id).expect("session should exist");
+        session.details.hostname = hostname.to_string();
+        session.details.title = title.to_string();
+        session.details.custom_title = None;
+        session.details.home_dir = "/home/tester".to_string();
+        id
     }
 
     #[test]
@@ -761,9 +1565,8 @@ mod tests {
         let mut session = test_session();
         session.chat.push(Message::User("hello".into()));
 
-        // Start streaming
-        let (_tx, rx) = mpsc::channel::<DaveApiResponse>();
-        session.incoming_tokens = Some(rx);
+        // Dispatch and start streaming
+        let _tx = make_streaming(&mut session);
 
         // New user message arrives while streaming
         session.chat.push(Message::User("another".into()));
@@ -775,16 +1578,14 @@ mod tests {
         let mut session = test_session();
         session.chat.push(Message::User("msg1".into()));
 
-        // Start streaming
-        let (tx, rx) = mpsc::channel::<DaveApiResponse>();
-        session.incoming_tokens = Some(rx);
+        // Dispatch and start streaming
+        let tx = make_streaming(&mut session);
 
-        // Assistant responds, then more user messages arrive
-        session
-            .chat
-            .push(Message::Assistant(AssistantMessage::from_text(
-                "response".into(),
-            )));
+        // Assistant responds via append_token (transitions to Streaming)
+        session.append_token("response");
+        session.finalize_last_assistant();
+
+        // New user message arrives while stream is still open
         session.chat.push(Message::User("msg2".into()));
 
         // Stream ends
@@ -799,14 +1600,12 @@ mod tests {
         let mut session = test_session();
         session.chat.push(Message::User("hello".into()));
 
-        let (tx, rx) = mpsc::channel::<DaveApiResponse>();
-        session.incoming_tokens = Some(rx);
+        // Dispatch and start streaming
+        let tx = make_streaming(&mut session);
 
-        session
-            .chat
-            .push(Message::Assistant(AssistantMessage::from_text(
-                "done".into(),
-            )));
+        // Backend responds
+        session.append_token("done");
+        session.finalize_last_assistant();
 
         drop(tx);
         session.incoming_tokens = None;
@@ -825,9 +1624,8 @@ mod tests {
         session.chat.push(Message::User("msg1".into()));
         assert!(session.should_dispatch_remote_message());
 
-        // Backend starts streaming
-        let (tx, rx) = mpsc::channel::<DaveApiResponse>();
-        session.incoming_tokens = Some(rx);
+        // Dispatch and start streaming
+        let tx = make_streaming(&mut session);
 
         // Messages arrive one per frame while streaming
         session.chat.push(Message::User("msg2".into()));
@@ -836,11 +1634,1501 @@ mod tests {
         session.chat.push(Message::User("msg3".into()));
         assert!(!session.should_dispatch_remote_message());
 
+        // Stream ends (backend didn't produce content — e.g. connection dropped)
+        drop(tx);
+        session.incoming_tokens = None;
+
+        // Should redispatch — new messages arrived beyond what was dispatched
+        assert!(session.needs_redispatch_after_stream_end());
+    }
+
+    // ---- append_token tests ----
+
+    #[test]
+    fn append_token_creates_assistant_when_empty() {
+        let mut session = test_session();
+        session.append_token("hello");
+        assert!(matches!(session.chat.last(), Some(Message::Assistant(_))));
+        assert_eq!(session.last_assistant_text().unwrap(), "hello");
+    }
+
+    #[test]
+    fn append_token_extends_existing_assistant() {
+        let mut session = test_session();
+        session.chat.push(Message::User("hi".into()));
+        session.append_token("hel");
+        session.append_token("lo");
+        assert_eq!(session.last_assistant_text().unwrap(), "hello");
+        assert!(matches!(session.chat.last(), Some(Message::Assistant(_))));
+    }
+
+    /// The key bug this prevents: tokens arriving after a queued user
+    /// message must NOT create a new Assistant that buries the queued
+    /// message. They should append to the existing Assistant before it.
+    #[test]
+    fn tokens_after_queued_message_dont_bury_it() {
+        let mut session = test_session();
+
+        // User sends initial message, dispatched and streaming starts
+        session.chat.push(Message::User("hello".into()));
+        let _tx = make_streaming(&mut session);
+        session.append_token("Sure, ");
+        session.append_token("I can ");
+
+        // User queues a follow-up while streaming
+        session.chat.push(Message::User("also do this".into()));
+
+        // More tokens arrive from the CURRENT stream (not the queued msg)
+        session.append_token("help!");
+
+        // The queued user message must still be last
+        assert!(
+            matches!(session.chat.last(), Some(Message::User(_))),
+            "queued user message should still be the last message"
+        );
+        assert!(session.has_pending_user_message());
+
+        // Tokens should have been appended to the existing assistant
+        assert_eq!(session.last_assistant_text().unwrap(), "Sure, I can help!");
+
+        // After stream ends, redispatch should fire
+        assert!(session.needs_redispatch_after_stream_end());
+    }
+
+    /// Multiple queued messages: all should remain after the assistant
+    /// response, and redispatch should still trigger.
+    #[test]
+    fn multiple_queued_messages_preserved() {
+        let mut session = test_session();
+
+        session.chat.push(Message::User("first".into()));
+        let _tx = make_streaming(&mut session);
+        session.append_token("response");
+
+        // Queue two messages
+        session.chat.push(Message::User("second".into()));
+        session.chat.push(Message::User("third".into()));
+
+        // More tokens arrive
+        session.append_token(" done");
+
+        // Last message should still be the queued user message
+        assert!(session.has_pending_user_message());
+        assert!(session.needs_redispatch_after_stream_end());
+
+        // Assistant text should be the combined response
+        assert_eq!(session.last_assistant_text().unwrap(), "response done");
+    }
+
+    /// After a turn is finalized, a new user message is sent and Claude
+    /// responds. Tokens for the NEW response must create a new Assistant
+    /// after the user message, not append to the finalized old one.
+    /// This was the root cause of the infinite redispatch loop.
+    #[test]
+    fn tokens_after_finalized_turn_create_new_assistant() {
+        let mut session = test_session();
+
+        // Complete turn 1
+        session.chat.push(Message::User("hello".into()));
+        session.append_token("first response");
+        session.finalize_last_assistant();
+
+        // User sends a new message (primary, not queued)
+        session.chat.push(Message::User("follow up".into()));
+
+        // Tokens arrive from Claude's new response
+        session.append_token("second ");
+        session.append_token("response");
+
+        // The new tokens must be in a NEW assistant after the user message
+        assert!(
+            matches!(session.chat.last(), Some(Message::Assistant(_))),
+            "new assistant should be the last message"
+        );
+        assert_eq!(session.last_assistant_text().unwrap(), "second response");
+
+        // The old assistant should still have its original text
+        let first_assistant_text = session
+            .chat
+            .iter()
+            .find_map(|m| match m {
+                Message::Assistant(msg) => {
+                    let t = msg.text().to_string();
+                    if t == "first response" {
+                        Some(t)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .expect("original assistant should still exist");
+        assert_eq!(first_assistant_text, "first response");
+
+        // No pending user message — assistant is last
+        assert!(!session.has_pending_user_message());
+    }
+
+    /// When a queued message arrives before the first token, the new
+    /// Assistant must be inserted between the dispatched user message
+    /// and the queued one, not after the queued one.
+    #[test]
+    fn queued_before_first_token_ordering() {
+        let mut session = test_session();
+
+        // Turn 1 complete
+        session.chat.push(Message::User("hello".into()));
+        session.append_token("response 1");
+        session.finalize_last_assistant();
+
+        // User sends a new message, dispatched to Claude (single dispatch)
+        session.chat.push(Message::User("follow up".into()));
+        session.mark_dispatched();
+
+        // User queues another message BEFORE any tokens arrive
+        session.chat.push(Message::User("queued msg".into()));
+
+        // Now first token arrives from Claude's response to "follow up"
+        session.append_token("response ");
+        session.append_token("2");
+
+        // Expected order: User("follow up"), Assistant("response 2"), User("queued msg")
+        let msgs: Vec<&str> = session
+            .chat
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(s) if s.text == "follow up" => Some("U:follow up"),
+                Message::User(s) if s.text == "queued msg" => Some("U:queued msg"),
+                Message::Assistant(a) if a.text() == "response 2" => Some("A:response 2"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            msgs,
+            vec!["U:follow up", "A:response 2", "U:queued msg"],
+            "assistant response should appear between dispatched and queued messages"
+        );
+
+        // Queued message should still be last → triggers redispatch
+        assert!(session.has_pending_user_message());
+    }
+
+    /// Text → tool call → more text: post-tool tokens must create a
+    /// new Assistant so the tool call appears between the two text blocks,
+    /// not get appended to the pre-tool Assistant (which would push the
+    /// tool call to the bottom).
+    #[test]
+    fn tokens_after_tool_call_create_new_assistant() {
+        let mut session = test_session();
+
+        session.chat.push(Message::User("do something".into()));
+        session.append_token("Let me read that file.");
+
+        // Tool call arrives mid-stream
+        let tool = crate::tools::ToolCall::invalid(
+            "call-1".into(),
+            Some("Read".into()),
+            None,
+            "test".into(),
+        );
+        session.chat.push(Message::ToolCalls(vec![tool]));
+        session
+            .chat
+            .push(Message::ToolResponse(crate::tools::ToolResponse::error(
+                "call-1".into(),
+                "test result".into(),
+            )));
+
+        // More tokens arrive after the tool call
+        session.append_token("Here is what I found.");
+
+        // Verify ordering: Assistant, ToolCalls, ToolResponse, Assistant
+        let labels: Vec<&str> = session
+            .chat
+            .iter()
+            .map(|m| match m {
+                Message::User(_) => "User",
+                Message::Assistant(_) => "Assistant",
+                Message::ToolCalls(_) => "ToolCalls",
+                Message::ToolResponse(_) => "ToolResponse",
+                _ => "Other",
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "User",
+                "Assistant",
+                "ToolCalls",
+                "ToolResponse",
+                "Assistant"
+            ],
+            "post-tool tokens should be in a new assistant, not appended to the first"
+        );
+
+        // Verify content of each assistant
+        let assistants: Vec<String> = session
+            .chat
+            .iter()
+            .filter_map(|m| match m {
+                Message::Assistant(a) => Some(a.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants[0], "Let me read that file.");
+        assert_eq!(assistants[1], "Here is what I found.");
+    }
+
+    // ---- finalize_last_assistant tests ----
+
+    #[test]
+    fn finalize_finds_assistant_before_queued_messages() {
+        let mut session = test_session();
+
+        session.chat.push(Message::User("hi".into()));
+        session.append_token("response");
+        session.chat.push(Message::User("queued".into()));
+
+        // Should finalize without panicking, even though last() is User
+        session.finalize_last_assistant();
+
+        // Verify the queued message is still there
+        assert!(session.has_pending_user_message());
+    }
+
+    // ---- status tests ----
+
+    /// Helper to put a session into "streaming" state.
+    /// Also calls `mark_dispatched()` to mirror what `send_user_message_for()`
+    /// does in real code — the trailing user messages are marked as dispatched.
+    fn make_streaming(session: &mut ChatSession) -> mpsc::Sender<DaveApiResponse> {
+        session.mark_dispatched();
+        let (tx, rx) = mpsc::channel::<DaveApiResponse>();
+        session.incoming_tokens = Some(rx);
+        tx
+    }
+
+    #[test]
+    fn status_idle_initially() {
+        let session = test_session();
+        assert_eq!(session.status(), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn status_idle_with_pending_user_message() {
+        let mut session = test_session();
+        session.chat.push(Message::User("hello".into()));
+        session.update_status();
+        // No task handle or incoming tokens → Idle
+        assert_eq!(session.status(), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn status_done_when_assistant_is_last() {
+        let mut session = test_session();
+        session.chat.push(Message::User("hello".into()));
+        session
+            .chat
+            .push(Message::Assistant(AssistantMessage::from_text(
+                "reply".into(),
+            )));
+        session.update_status();
+        assert_eq!(session.status(), AgentStatus::Done);
+    }
+
+    // ---- batch redispatch lifecycle tests ----
+
+    /// Simulates the full lifecycle of queued message batch dispatch:
+    /// 1. User sends message → dispatched
+    /// 2. While streaming, user queues 3 more messages
+    /// 3. Stream ends → needs_redispatch is true
+    /// 4. On redispatch, get_pending_user_messages collects all 3
+    /// 5. After redispatch, new tokens create response after all queued msgs
+    #[test]
+    fn batch_redispatch_full_lifecycle() {
+        let mut session = test_session();
+        use crate::backend::shared;
+
+        // Step 1: User sends first message, it gets dispatched (single)
+        session.chat.push(Message::User("hello".into()));
+        assert!(session.should_dispatch_remote_message());
+
+        // Backend starts streaming (mark_dispatched called by make_streaming)
+        let tx = make_streaming(&mut session);
+        assert!(session.is_streaming());
+        assert!(!session.should_dispatch_remote_message());
+
+        // First tokens arrive
+        session.append_token("Sure, ");
+        session.append_token("I can help.");
+
+        // Step 2: User queues 3 messages while streaming
+        session.chat.push(Message::User("also".into()));
+        session.chat.push(Message::User("do this".into()));
+        session.chat.push(Message::User("and this".into()));
+
+        // Should NOT dispatch while streaming
+        assert!(!session.should_dispatch_remote_message());
+
+        // More tokens arrive — should append to the streaming assistant,
+        // not create new ones after the queued messages
+        session.append_token(" Let me ");
+        session.append_token("check.");
+
+        // Verify the assistant text is continuous
+        assert_eq!(
+            session.last_assistant_text().unwrap(),
+            "Sure, I can help. Let me check."
+        );
+
+        // Queued messages should still be at the end
+        assert!(session.has_pending_user_message());
+
+        // Step 3: Stream ends
+        session.finalize_last_assistant();
+        drop(tx);
+        session.incoming_tokens = None;
+
+        assert!(!session.is_streaming());
+        assert!(session.needs_redispatch_after_stream_end());
+
+        // Step 4: At redispatch time, get_pending_user_messages should
+        // collect ALL trailing user messages
+        let prompt = shared::get_pending_user_messages(&session.chat);
+        assert_eq!(prompt, "also\ndo this\nand this");
+
+        // Step 5: Backend dispatches with the batch prompt (3 messages)
+        let _tx2 = make_streaming(&mut session);
+
+        // New tokens arrive — should create a new assistant after ALL
+        // dispatched messages (since they were all sent in the batch)
+        session.append_token("OK, doing all three.");
+
+        // Verify chat order: response 2 should come after all 3
+        // batch-dispatched user messages
+        let types: Vec<&str> = session
+            .chat
+            .iter()
+            .map(|m| match m {
+                Message::User(_) => "User",
+                Message::Assistant(_) => "Assistant",
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(
+            types,
+            // Turn 1: User → Assistant
+            // Turn 2: User, User, User (batch) → Assistant
+            vec!["User", "Assistant", "User", "User", "User", "Assistant"],
+        );
+        // Verify the second assistant has the right text
+        assert_eq!(
+            session.last_assistant_text().unwrap(),
+            "OK, doing all three."
+        );
+    }
+
+    /// When all queued messages are batch-dispatched, no redispatch
+    /// should be needed after the second stream completes (assuming
+    /// no new messages arrive).
+    #[test]
+    fn no_double_redispatch_after_batch() {
+        let mut session = test_session();
+
+        // Turn 1: single dispatch
+        session.chat.push(Message::User("first".into()));
+        let tx = make_streaming(&mut session);
+        session.append_token("response 1");
+        session.chat.push(Message::User("queued A".into()));
+        session.chat.push(Message::User("queued B".into()));
+        session.finalize_last_assistant();
+        drop(tx);
+        session.incoming_tokens = None;
+        assert!(session.needs_redispatch_after_stream_end());
+
+        // Turn 2: batch redispatch handles both queued messages
+        let tx2 = make_streaming(&mut session);
+        session.append_token("response 2");
+        session.finalize_last_assistant();
+        drop(tx2);
+        session.incoming_tokens = None;
+
+        // No more pending user messages after the assistant response
+        assert!(
+            !session.needs_redispatch_after_stream_end(),
+            "should not need another redispatch when no new messages arrived"
+        );
+    }
+
+    /// When a stream ends with an error (no tokens produced), the
+    /// Error message should prevent infinite redispatch.
+    #[test]
+    fn error_prevents_redispatch_loop() {
+        let mut session = test_session();
+
+        session.chat.push(Message::User("hello".into()));
+        let tx = make_streaming(&mut session);
+
+        // Error arrives (no tokens were sent)
+        session
+            .chat
+            .push(Message::Error("context window exceeded".into()));
+
         // Stream ends
         drop(tx);
         session.incoming_tokens = None;
 
-        // Should redispatch — there are unanswered user messages
+        assert!(
+            !session.needs_redispatch_after_stream_end(),
+            "error should prevent redispatch"
+        );
+    }
+
+    /// When the backend returns immediately with no content (e.g. a
+    /// skill command it can't handle), the dispatched user message is
+    /// still the last in chat. Without the trailing-count guard this
+    /// would trigger an infinite redispatch loop.
+    #[test]
+    fn empty_response_prevents_redispatch_loop() {
+        let mut session = test_session();
+
+        session
+            .chat
+            .push(Message::User("/refactor something".into()));
+        let tx = make_streaming(&mut session);
+
+        // Backend returns immediately — no tokens, no tools, nothing
+        session.finalize_last_assistant();
+        drop(tx);
+        session.incoming_tokens = None;
+
+        assert!(
+            !session.needs_redispatch_after_stream_end(),
+            "should not redispatch already-dispatched messages with empty response"
+        );
+    }
+
+    /// Verify chat ordering when queued messages arrive before any
+    /// tokens, and after tokens, across a full batch lifecycle.
+    #[test]
+    fn chat_ordering_with_mixed_timing() {
+        let mut session = test_session();
+
+        // Turn 1 complete
+        session.chat.push(Message::User("hello".into()));
+        session.append_token("hi there");
+        session.finalize_last_assistant();
+
+        // User sends new message (single dispatch)
+        session.chat.push(Message::User("question".into()));
+        let tx = make_streaming(&mut session);
+
+        // Queued BEFORE first token
+        session.chat.push(Message::User("early queue".into()));
+
+        // First token arrives
+        session.append_token("answer ");
+
+        // Queued AFTER first token
+        session.chat.push(Message::User("late queue".into()));
+
+        // More tokens
+        session.append_token("here");
+
+        // Verify: assistant response should be between dispatched
+        // user and the queued messages
+        let types: Vec<String> = session
+            .chat
+            .iter()
+            .map(|m| match m {
+                Message::User(s) => format!("U:{}", s.text),
+                Message::Assistant(a) => format!("A:{}", a.text()),
+                _ => "?".into(),
+            })
+            .collect();
+
+        // The key constraint: "answer here" must appear after
+        // "question" and before the queued messages
+        let answer_pos = types.iter().position(|t| t == "A:answer here").unwrap();
+        let question_pos = types.iter().position(|t| t == "U:question").unwrap();
+        let early_pos = types.iter().position(|t| t == "U:early queue").unwrap();
+        let late_pos = types.iter().position(|t| t == "U:late queue").unwrap();
+
+        assert!(
+            answer_pos > question_pos,
+            "answer should come after the dispatched question"
+        );
+        assert!(
+            early_pos > answer_pos || late_pos > answer_pos,
+            "at least one queued message should be after the answer"
+        );
+
+        // Finalize and check redispatch
+        session.finalize_last_assistant();
+        drop(tx);
+        session.incoming_tokens = None;
         assert!(session.needs_redispatch_after_stream_end());
+    }
+
+    /// Queued indicator detection: helper that mimics what the UI does
+    /// to find which messages are "queued".
+    fn find_queued_indices(
+        chat: &[Message],
+        is_working: bool,
+        dispatch_state: DispatchState,
+    ) -> Vec<usize> {
+        if !is_working {
+            return vec![];
+        }
+        let last_non_user = chat.iter().rposition(|m| !matches!(m, Message::User(_)));
+        let queued_from = match last_non_user {
+            Some(i) if matches!(chat[i], Message::Assistant(ref m) if m.is_streaming()) => {
+                let first_trailing = i + 1;
+                if first_trailing < chat.len() {
+                    Some(first_trailing)
+                } else {
+                    None
+                }
+            }
+            Some(i) => {
+                let first_trailing = i + 1;
+                let skip = dispatch_state.dispatched_count().max(1);
+                let queued_start = first_trailing + skip;
+                if queued_start < chat.len() {
+                    Some(queued_start)
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        match queued_from {
+            Some(qi) => (qi..chat.len())
+                .filter(|&i| matches!(chat[i], Message::User(_)))
+                .collect(),
+            None => vec![],
+        }
+    }
+
+    #[test]
+    fn queued_indicator_before_first_token() {
+        // Chat: [...finalized Asst], User("dispatched"), User("queued")
+        // No streaming assistant yet → dispatched is being processed,
+        // only "queued" should show the indicator.
+        let mut session = test_session();
+        session.chat.push(Message::User("prev".into()));
+        session
+            .chat
+            .push(Message::Assistant(AssistantMessage::from_text(
+                "prev reply".into(),
+            )));
+        session.chat.push(Message::User("dispatched".into()));
+        session.chat.push(Message::User("queued 1".into()));
+        session.chat.push(Message::User("queued 2".into()));
+
+        // Single dispatch
+        let queued = find_queued_indices(
+            &session.chat,
+            true,
+            DispatchState::AwaitingResponse { count: 1 },
+        );
+        let queued_texts: Vec<&str> = queued
+            .iter()
+            .map(|&i| match &session.chat[i] {
+                Message::User(s) => s.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(
+            queued_texts,
+            vec!["queued 1", "queued 2"],
+            "dispatched message should not be marked as queued"
+        );
+    }
+
+    #[test]
+    fn queued_indicator_during_streaming() {
+        // Chat: User("dispatched"), Assistant(streaming), User("queued")
+        // Streaming assistant separates dispatched from queued.
+        let mut session = test_session();
+        session.chat.push(Message::User("dispatched".into()));
+        session.append_token("streaming...");
+        session.chat.push(Message::User("queued 1".into()));
+        session.chat.push(Message::User("queued 2".into()));
+
+        // Dispatch state doesn't matter here — streaming assistant
+        // branch doesn't use the dispatched count
+        let queued = find_queued_indices(
+            &session.chat,
+            true,
+            DispatchState::AwaitingResponse { count: 1 },
+        );
+        let queued_texts: Vec<&str> = queued
+            .iter()
+            .map(|&i| match &session.chat[i] {
+                Message::User(s) => s.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(
+            queued_texts,
+            vec!["queued 1", "queued 2"],
+            "all user messages after streaming assistant should be queued"
+        );
+    }
+
+    #[test]
+    fn queued_indicator_not_working() {
+        // When not working, nothing should be marked as queued
+        let mut session = test_session();
+        session.chat.push(Message::User("msg 1".into()));
+        session.chat.push(Message::User("msg 2".into()));
+
+        let queued = find_queued_indices(&session.chat, false, DispatchState::Idle);
+        assert!(
+            queued.is_empty(),
+            "nothing should be queued when not working"
+        );
+    }
+
+    #[test]
+    fn queued_indicator_no_queued_messages() {
+        // Working but only one user message → nothing queued
+        let mut session = test_session();
+        session
+            .chat
+            .push(Message::Assistant(AssistantMessage::from_text(
+                "prev".into(),
+            )));
+        session.chat.push(Message::User("only one".into()));
+
+        let queued = find_queued_indices(
+            &session.chat,
+            true,
+            DispatchState::AwaitingResponse { count: 1 },
+        );
+        assert!(
+            queued.is_empty(),
+            "single dispatched message should not be queued"
+        );
+    }
+
+    #[test]
+    fn queued_indicator_after_tool_call_with_streaming() {
+        // Chat: User, Asst, ToolCalls, ToolResponse, Asst(streaming), User(queued)
+        let mut session = test_session();
+        session.chat.push(Message::User("do something".into()));
+        session.append_token("Let me check.");
+
+        let tool =
+            crate::tools::ToolCall::invalid("c1".into(), Some("Read".into()), None, "test".into());
+        session.chat.push(Message::ToolCalls(vec![tool]));
+        session
+            .chat
+            .push(Message::ToolResponse(crate::tools::ToolResponse::error(
+                "c1".into(),
+                "result".into(),
+            )));
+
+        // Post-tool tokens create new streaming assistant
+        session.append_token("Found it.");
+        session.chat.push(Message::User("queued".into()));
+
+        let queued = find_queued_indices(
+            &session.chat,
+            true,
+            DispatchState::AwaitingResponse { count: 1 },
+        );
+        let queued_texts: Vec<&str> = queued
+            .iter()
+            .map(|&i| match &session.chat[i] {
+                Message::User(s) => s.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(queued_texts, vec!["queued"]);
+    }
+
+    /// Batch dispatch: when 3 messages were dispatched together,
+    /// none should show "queued" before the first token arrives.
+    #[test]
+    fn queued_indicator_batch_dispatch_no_queued() {
+        let mut session = test_session();
+        session
+            .chat
+            .push(Message::Assistant(AssistantMessage::from_text(
+                "prev reply".into(),
+            )));
+        session.chat.push(Message::User("a".into()));
+        session.chat.push(Message::User("b".into()));
+        session.chat.push(Message::User("c".into()));
+
+        // All 3 were batch-dispatched
+        let queued = find_queued_indices(
+            &session.chat,
+            true,
+            DispatchState::AwaitingResponse { count: 3 },
+        );
+        assert!(
+            queued.is_empty(),
+            "all 3 messages were dispatched — none should show queued"
+        );
+    }
+
+    /// Batch dispatch with new message queued after: 3 dispatched,
+    /// then 1 more arrives. Only the new one should be "queued".
+    #[test]
+    fn queued_indicator_batch_with_new_queued() {
+        let mut session = test_session();
+        session
+            .chat
+            .push(Message::Assistant(AssistantMessage::from_text(
+                "prev reply".into(),
+            )));
+        session.chat.push(Message::User("a".into()));
+        session.chat.push(Message::User("b".into()));
+        session.chat.push(Message::User("c".into()));
+        session.chat.push(Message::User("new queued".into()));
+
+        // 3 were dispatched, 1 new arrival
+        let queued = find_queued_indices(
+            &session.chat,
+            true,
+            DispatchState::AwaitingResponse { count: 3 },
+        );
+        let queued_texts: Vec<&str> = queued
+            .iter()
+            .map(|&i| match &session.chat[i] {
+                Message::User(s) => s.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(
+            queued_texts,
+            vec!["new queued"],
+            "only the message after the batch should be queued"
+        );
+    }
+
+    #[test]
+    fn test_friendly_model_name_known_models() {
+        for model in BackendType::Claude.available_models() {
+            if let Some(id) = model.to_model_id() {
+                let friendly = friendly_model_name(id);
+                assert_ne!(
+                    friendly, id,
+                    "Claude model {id:?} should have a friendly display name"
+                );
+            }
+        }
+    }
+
+    // ---- remote session tests ----
+
+    fn test_remote_session() -> ChatSession {
+        let mut session = ChatSession::new(
+            99,
+            PathBuf::from("/tmp"),
+            AiMode::Agentic,
+            BackendType::Claude,
+        );
+        session.source = SessionSource::Remote;
+        session
+    }
+
+    #[test]
+    fn remote_session_source() {
+        let session = test_remote_session();
+        assert!(session.is_remote());
+        assert_eq!(session.source, SessionSource::Remote);
+    }
+
+    #[test]
+    fn local_session_is_not_remote() {
+        let session = test_session();
+        assert!(!session.is_remote());
+    }
+
+    #[test]
+    fn remote_hostnames_only_returns_unique_sorted_remote_hosts() {
+        let mut mgr = SessionManager::new();
+
+        let local_id =
+            create_grouped_session(&mut mgr, "local-host", "/work/a", "Local", AiMode::Agentic);
+        let remote_b =
+            create_grouped_session(&mut mgr, "beta-host", "/srv/b", "Remote B", AiMode::Agentic);
+        let remote_a = create_grouped_session(
+            &mut mgr,
+            "alpha-host",
+            "/srv/a",
+            "Remote A",
+            AiMode::Agentic,
+        );
+        let remote_dup = create_grouped_session(
+            &mut mgr,
+            "beta-host",
+            "/srv/other",
+            "Remote B 2",
+            AiMode::Agentic,
+        );
+
+        mgr.get_mut(local_id).expect("local session").source = SessionSource::Local;
+        mgr.get_mut(remote_a).expect("remote session").source = SessionSource::Remote;
+        mgr.get_mut(remote_b).expect("remote session").source = SessionSource::Remote;
+        mgr.get_mut(remote_dup).expect("remote session").source = SessionSource::Remote;
+
+        assert_eq!(
+            mgr.remote_hostnames(),
+            vec!["alpha-host".to_string(), "beta-host".to_string()]
+        );
+    }
+
+    #[test]
+    fn remote_dispatch_idle_with_user_message() {
+        let mut session = test_remote_session();
+        session.chat.push(Message::User("hello".into()));
+        assert!(session.should_dispatch_remote_message());
+    }
+
+    #[test]
+    fn remote_no_dispatch_without_user_message() {
+        let session = test_remote_session();
+        assert!(!session.should_dispatch_remote_message());
+    }
+
+    #[test]
+    fn remote_no_dispatch_while_streaming() {
+        let mut session = test_remote_session();
+        session.chat.push(Message::User("hello".into()));
+        let _tx = make_streaming(&mut session);
+        session.chat.push(Message::User("another".into()));
+        assert!(!session.should_dispatch_remote_message());
+    }
+
+    // ---- subagent lifecycle tests ----
+
+    fn make_subagent(task_id: &str, desc: &str) -> crate::messages::SubagentInfo {
+        crate::messages::SubagentInfo {
+            task_id: task_id.to_string(),
+            description: desc.to_string(),
+            subagent_type: "Explore".to_string(),
+            status: crate::messages::SubagentStatus::Running,
+            output: String::new(),
+            max_output_size: 1000,
+            tool_results: vec![],
+        }
+    }
+
+    #[test]
+    fn subagent_output_updates() {
+        let mut session = test_session();
+        let subagent = make_subagent("task-1", "exploring");
+        let task_id = subagent.task_id.clone();
+        let idx = session.chat.len();
+        session.chat.push(Message::Subagent(subagent));
+        if let Some(ref mut agentic) = session.agentic {
+            agentic.subagent_indices.insert(task_id.clone(), idx);
+        }
+
+        session.update_subagent_output(&task_id, "first ");
+        session.update_subagent_output(&task_id, "second");
+
+        if let Some(Message::Subagent(s)) = session.chat.get(idx) {
+            assert_eq!(s.output, "first second");
+            assert_eq!(s.status, crate::messages::SubagentStatus::Running);
+        } else {
+            panic!("expected Subagent message at index {}", idx);
+        }
+    }
+
+    #[test]
+    fn subagent_completion() {
+        let mut session = test_session();
+        let subagent = make_subagent("task-1", "exploring");
+        let task_id = subagent.task_id.clone();
+        let idx = session.chat.len();
+        session.chat.push(Message::Subagent(subagent));
+        if let Some(ref mut agentic) = session.agentic {
+            agentic.subagent_indices.insert(task_id.clone(), idx);
+        }
+
+        session.update_subagent_output(&task_id, "partial output");
+        session.complete_subagent(&task_id, "final result");
+
+        if let Some(Message::Subagent(s)) = session.chat.get(idx) {
+            assert_eq!(s.status, crate::messages::SubagentStatus::Completed);
+            assert_eq!(s.output, "final result");
+        } else {
+            panic!("expected Subagent message at index {}", idx);
+        }
+    }
+
+    #[test]
+    fn subagent_output_truncation() {
+        let mut session = test_session();
+        let mut subagent = make_subagent("task-1", "exploring");
+        subagent.max_output_size = 20;
+        let task_id = subagent.task_id.clone();
+        let idx = session.chat.len();
+        session.chat.push(Message::Subagent(subagent));
+        if let Some(ref mut agentic) = session.agentic {
+            agentic.subagent_indices.insert(task_id.clone(), idx);
+        }
+
+        // Push output that exceeds max_output_size
+        session
+            .update_subagent_output(&task_id, "a long output that is way too big for the buffer");
+
+        if let Some(Message::Subagent(s)) = session.chat.get(idx) {
+            assert!(
+                s.output.len() <= 20,
+                "output should be truncated to max_output_size, got len {}",
+                s.output.len()
+            );
+        } else {
+            panic!("expected Subagent message");
+        }
+    }
+
+    /// Truncation must not panic on multi-byte UTF-8 characters.
+    /// Before the fix, slicing at arbitrary byte offsets would panic
+    /// with "byte index X is not a char boundary".
+    #[test]
+    fn subagent_output_truncation_utf8_emoji() {
+        let mut session = test_session();
+        let mut subagent = make_subagent("task-emoji", "exploring");
+        subagent.max_output_size = 7;
+        let task_id = subagent.task_id.clone();
+        let idx = session.chat.len();
+        session.chat.push(Message::Subagent(subagent));
+        if let Some(ref mut agentic) = session.agentic {
+            agentic.subagent_indices.insert(task_id.clone(), idx);
+        }
+
+        // "OK🌍" = 6 bytes (O=1, K=1, 🌍=4)
+        session.update_subagent_output(&task_id, "OK🌍");
+        // "More🎉test" = 11 bytes
+        // Total: 17 bytes, max: 7, keep_from: 10
+        // Byte 10 is mid-emoji — must not panic
+        session.update_subagent_output(&task_id, "More🎉test");
+
+        if let Some(Message::Subagent(s)) = session.chat.get(idx) {
+            assert!(s.output.len() <= 7, "got len {}", s.output.len());
+            // Verify the result is valid UTF-8 (it is, since it's a String)
+            assert!(s.output.is_ascii() || !s.output.is_empty());
+        } else {
+            panic!("expected Subagent message");
+        }
+    }
+
+    #[test]
+    fn test_friendly_model_name_unknown() {
+        for model in BackendType::OpenAI.available_models() {
+            if let Some(id) = model.to_model_id() {
+                assert_eq!(
+                    friendly_model_name(id),
+                    id,
+                    "OpenAI model should pass through as-is"
+                );
+            }
+        }
+        assert_eq!(
+            friendly_model_name("some-unknown-model"),
+            "some-unknown-model"
+        );
+    }
+
+    #[test]
+    fn subagent_output_truncation_utf8_cjk() {
+        let mut session = test_session();
+        let mut subagent = make_subagent("task-cjk", "exploring");
+        subagent.max_output_size = 8;
+        let task_id = subagent.task_id.clone();
+        let idx = session.chat.len();
+        session.chat.push(Message::Subagent(subagent));
+        if let Some(ref mut agentic) = session.agentic {
+            agentic.subagent_indices.insert(task_id.clone(), idx);
+        }
+
+        // "你好" = 6 bytes (3 per CJK char)
+        session.update_subagent_output(&task_id, "你好");
+        // "世界" = 6 bytes
+        // Total: 12 bytes, max: 8, keep_from: 4 — mid-char boundary
+        session.update_subagent_output(&task_id, "世界");
+
+        if let Some(Message::Subagent(s)) = session.chat.get(idx) {
+            assert!(s.output.len() <= 8, "got len {}", s.output.len());
+        } else {
+            panic!("expected Subagent message");
+        }
+    }
+
+    #[test]
+    fn fold_tool_result_into_subagent() {
+        let mut session = test_session();
+        let subagent = make_subagent("task-1", "exploring");
+        let task_id = subagent.task_id.clone();
+        let idx = session.chat.len();
+        session.chat.push(Message::Subagent(subagent));
+        if let Some(ref mut agentic) = session.agentic {
+            agentic.subagent_indices.insert(task_id.clone(), idx);
+        }
+
+        let result = crate::messages::ExecutedTool {
+            tool_name: "Read".to_string(),
+            summary: "42 lines".to_string(),
+            parent_task_id: Some("task-1".to_string()),
+            file_update: None,
+        };
+
+        // Should be folded (returns None)
+        let folded = session.fold_tool_result(result);
+        assert!(
+            folded.is_none(),
+            "result with matching parent should be folded"
+        );
+
+        // Verify it was added to the subagent's tool_results
+        if let Some(Message::Subagent(s)) = session.chat.get(idx) {
+            assert_eq!(s.tool_results.len(), 1);
+            assert_eq!(s.tool_results[0].tool_name, "Read");
+        } else {
+            panic!("expected Subagent message");
+        }
+    }
+
+    #[test]
+    fn fold_tool_result_no_parent() {
+        let mut session = test_session();
+        let result = crate::messages::ExecutedTool {
+            tool_name: "Bash".to_string(),
+            summary: "exit 0".to_string(),
+            parent_task_id: None,
+            file_update: None,
+        };
+
+        // Should NOT be folded (returns Some)
+        let not_folded = session.fold_tool_result(result);
+        assert!(
+            not_folded.is_some(),
+            "result without parent should not be folded"
+        );
+    }
+
+    // ---- edge case: silent failures ----
+
+    #[test]
+    fn subagent_output_nonexistent_task_no_panic() {
+        let mut session = test_session();
+        // Should silently do nothing — no matching task_id in indices
+        session.update_subagent_output("nonexistent-id", "output");
+        assert!(session.chat.is_empty());
+    }
+
+    #[test]
+    fn complete_subagent_nonexistent_task_no_panic() {
+        let mut session = test_session();
+        session.complete_subagent("nonexistent-id", "result");
+        assert!(session.chat.is_empty());
+    }
+
+    #[test]
+    fn fold_tool_result_nonexistent_parent_returns_result() {
+        let mut session = test_session();
+        let result = crate::messages::ExecutedTool {
+            tool_name: "Read".to_string(),
+            summary: "42 lines".to_string(),
+            parent_task_id: Some("nonexistent-task".to_string()),
+            file_update: None,
+        };
+        // Parent doesn't exist — should return the result unfolded
+        let not_folded = session.fold_tool_result(result);
+        assert!(
+            not_folded.is_some(),
+            "result with nonexistent parent should not be folded"
+        );
+    }
+
+    #[test]
+    fn session_manager_touch_nonexistent_no_panic() {
+        let mut mgr = SessionManager::new();
+        let id = mgr.new_session(PathBuf::from("/tmp"), AiMode::Chat, BackendType::OpenAI);
+        // Touch a non-existent ID — should be a silent no-op
+        mgr.touch(999);
+        // Original session should be unaffected and still first
+        let ordered = mgr.sessions_ordered();
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0].id, id);
+    }
+
+    #[test]
+    fn session_manager_delete_active_clears_active() {
+        let mut mgr = SessionManager::new();
+        let id = mgr.new_session(PathBuf::from("/tmp"), AiMode::Chat, BackendType::OpenAI);
+        // id should be active after creation
+        assert_eq!(mgr.active_id(), Some(id));
+        mgr.delete_session(id);
+        // After deleting the only (active) session, both active and get should be gone
+        assert!(mgr.active_id().is_none());
+        assert!(mgr.get(id).is_none());
+        assert!(mgr.is_empty());
+    }
+
+    // ---- session manager tests ----
+
+    #[test]
+    fn session_manager_create_and_get() {
+        let mut mgr = SessionManager::new();
+        let id = mgr.new_session(PathBuf::from("/tmp"), AiMode::Agentic, BackendType::Claude);
+        let session = mgr.get(id).expect("session should exist after creation");
+        assert_eq!(session.id, id);
+        assert_eq!(session.ai_mode, AiMode::Agentic);
+        assert!(mgr.get_mut(id).is_some());
+        assert_eq!(mgr.active_id(), Some(id));
+    }
+
+    #[test]
+    fn session_manager_delete() {
+        let mut mgr = SessionManager::new();
+        let id1 = mgr.new_session(PathBuf::from("/tmp"), AiMode::Chat, BackendType::OpenAI);
+        let id2 = mgr.new_session(PathBuf::from("/tmp"), AiMode::Chat, BackendType::OpenAI);
+        assert_eq!(mgr.len(), 2);
+        mgr.delete_session(id1);
+        assert!(mgr.get(id1).is_none());
+        assert!(mgr.get(id2).is_some());
+        assert_eq!(mgr.len(), 1);
+    }
+
+    #[test]
+    fn session_manager_ordering() {
+        let mut mgr = SessionManager::new();
+        let id1 = mgr.new_session(PathBuf::from("/tmp"), AiMode::Chat, BackendType::OpenAI);
+        let _id2 = mgr.new_session(PathBuf::from("/tmp"), AiMode::Chat, BackendType::OpenAI);
+        let id3 = mgr.new_session(PathBuf::from("/tmp"), AiMode::Chat, BackendType::OpenAI);
+
+        // Most recent (first in order) should be last created
+        let ordered = mgr.sessions_ordered();
+        assert_eq!(ordered[0].id, id3);
+
+        // Touch id1 to make it most recent
+        mgr.touch(id1);
+        let ordered = mgr.sessions_ordered();
+        assert_eq!(ordered[0].id, id1);
+
+        // Verify all three are still present
+        assert_eq!(ordered.len(), 3);
+    }
+
+    #[test]
+    fn chat_id_cache_refreshes_after_touch_without_manual_rebuild() {
+        let mut mgr = SessionManager::new();
+        let id1 = mgr.new_session(PathBuf::from("/tmp/one"), AiMode::Chat, BackendType::OpenAI);
+        let id2 = mgr.new_session(PathBuf::from("/tmp/two"), AiMode::Chat, BackendType::OpenAI);
+
+        assert_eq!(mgr.chat_ids(), &[id2, id1]);
+
+        mgr.touch(id1);
+        assert_eq!(mgr.chat_ids(), &[id1, id2]);
+    }
+
+    #[test]
+    fn host_group_cache_refreshes_after_get_mut_hostname_change() {
+        let mut mgr = SessionManager::new();
+        let id = mgr.new_session(
+            PathBuf::from("/tmp/work"),
+            AiMode::Agentic,
+            BackendType::Claude,
+        );
+
+        {
+            let session = mgr.get_mut(id).expect("session should exist");
+            session.details.hostname = "remote-a".to_string();
+        }
+
+        let groups = mgr.host_cwd_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hostname, "remote-a");
+    }
+
+    #[test]
+    fn pending_placeholder_group_uses_requested_cwd() {
+        let mut mgr = SessionManager::new();
+        let requested_cwd = PathBuf::from("/srv/project");
+        mgr.new_pending_placeholder(
+            requested_cwd.clone(),
+            "remote-a".to_string(),
+            BackendType::Claude,
+            "spawn-1".to_string(),
+        );
+
+        let groups = mgr.host_cwd_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hostname, "remote-a");
+        assert_eq!(groups[0].cwd_groups.len(), 1);
+        assert_eq!(groups[0].cwd_groups[0].cwd, requested_cwd);
+        assert_eq!(groups[0].cwd_groups[0].display_cwd, "/srv/project");
+    }
+
+    #[test]
+    fn rebuild_cwd_groups_groups_hosts_cwds_and_sessions_deterministically() {
+        let mut mgr = SessionManager::new();
+
+        let local_zulu =
+            create_grouped_session(&mut mgr, "", "/work/alpha", "Zulu task", AiMode::Agentic);
+        let local_alpha =
+            create_grouped_session(&mut mgr, "", "/work/alpha", "Alpha task", AiMode::Agentic);
+        let remote_beta = create_grouped_session(
+            &mut mgr,
+            "beta-host",
+            "/srv/backend",
+            "Beta host task",
+            AiMode::Agentic,
+        );
+        let remote_zulu = create_grouped_session(
+            &mut mgr,
+            "zulu-host",
+            "/srv/api",
+            "Zulu host task",
+            AiMode::Agentic,
+        );
+        let chat_id = create_grouped_session(&mut mgr, "", "/chat/ignored", "Chat", AiMode::Chat);
+
+        mgr.rebuild_cwd_groups();
+
+        let groups = mgr.host_cwd_groups();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].hostname, "");
+        assert_eq!(groups[1].hostname, "beta-host");
+        assert_eq!(groups[2].hostname, "zulu-host");
+
+        let local_group = &groups[0];
+        assert_eq!(local_group.cwd_groups.len(), 1);
+        assert_eq!(local_group.cwd_groups[0].display_cwd, "/work/alpha");
+        assert_eq!(
+            local_group.cwd_groups[0].session_ids,
+            vec![local_alpha, local_zulu]
+        );
+
+        assert_eq!(groups[1].cwd_groups[0].session_ids, vec![remote_beta]);
+        assert_eq!(groups[2].cwd_groups[0].session_ids, vec![remote_zulu]);
+
+        assert_eq!(
+            mgr.visual_order(&CollapseState::new()),
+            vec![local_alpha, local_zulu, remote_beta, remote_zulu, chat_id]
+        );
+    }
+
+    #[test]
+    fn rebuild_cwd_groups_sorts_multiple_cwds_within_a_host() {
+        let mut mgr = SessionManager::new();
+
+        let alpha_first = create_grouped_session(
+            &mut mgr,
+            "remote-a",
+            "/srv/alpha",
+            "Alpha first",
+            AiMode::Agentic,
+        );
+        let zeta_only = create_grouped_session(
+            &mut mgr,
+            "remote-a",
+            "/srv/zeta",
+            "Zeta only",
+            AiMode::Agentic,
+        );
+        let alpha_second = create_grouped_session(
+            &mut mgr,
+            "remote-a",
+            "/srv/alpha",
+            "Alpha second",
+            AiMode::Agentic,
+        );
+
+        mgr.rebuild_cwd_groups();
+
+        let groups = mgr.host_cwd_groups();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].hostname, "remote-a");
+        assert_eq!(groups[0].cwd_groups.len(), 2);
+        assert_eq!(groups[0].cwd_groups[0].display_cwd, "/srv/alpha");
+        assert_eq!(groups[0].cwd_groups[1].display_cwd, "/srv/zeta");
+        assert_eq!(
+            groups[0].cwd_groups[0].session_ids,
+            vec![alpha_first, alpha_second]
+        );
+        assert_eq!(groups[0].cwd_groups[1].session_ids, vec![zeta_only]);
+        assert_eq!(
+            mgr.visual_order(&CollapseState::new()),
+            vec![alpha_first, alpha_second, zeta_only]
+        );
+    }
+
+    #[test]
+    fn visual_order_skips_collapsed_hosts_and_cwds_but_keeps_chats() {
+        let mut mgr = SessionManager::new();
+
+        // Two sessions in /work/a so the cwd is collapsible (single-session
+        // cwds always stay visible regardless of collapse state).
+        let _local_a1 =
+            create_grouped_session(&mut mgr, "", "/work/a", "Local A1", AiMode::Agentic);
+        let _local_a2 =
+            create_grouped_session(&mut mgr, "", "/work/a", "Local A2", AiMode::Agentic);
+        let local_b = create_grouped_session(&mut mgr, "", "/work/b", "Local B", AiMode::Agentic);
+        let remote_a = create_grouped_session(
+            &mut mgr,
+            "remote-a",
+            "/srv/keep",
+            "Remote A",
+            AiMode::Agentic,
+        );
+        let _remote_b = create_grouped_session(
+            &mut mgr,
+            "remote-b",
+            "/srv/hide",
+            "Remote B",
+            AiMode::Agentic,
+        );
+        let chat_id = create_grouped_session(&mut mgr, "", "/chat/ignored", "Chat", AiMode::Chat);
+
+        mgr.rebuild_cwd_groups();
+
+        let mut collapse = CollapseState::new();
+        collapse.toggle_cwd("", std::path::Path::new("/work/a"));
+        collapse.toggle_host("remote-b");
+
+        assert_eq!(
+            mgr.visual_order(&collapse),
+            vec![local_b, remote_a, chat_id]
+        );
+    }
+
+    #[test]
+    fn visual_order_keeps_single_session_cwd_visible_even_if_marked_collapsed() {
+        let mut mgr = SessionManager::new();
+
+        // Only one session in /work/solo — its cwd cannot be collapsed in the
+        // UI (no folder header is rendered), so a stale `is_cwd_collapsed`
+        // entry must not hide it from keyboard navigation.
+        let solo = create_grouped_session(&mut mgr, "", "/work/solo", "Solo", AiMode::Agentic);
+
+        mgr.rebuild_cwd_groups();
+
+        let mut collapse = CollapseState::new();
+        collapse.toggle_cwd("", std::path::Path::new("/work/solo"));
+
+        assert_eq!(mgr.visual_order(&collapse), vec![solo]);
+    }
+
+    // ---- compact_intent / take_compact_and_proceed tests ----
+
+    #[test]
+    fn take_compact_and_proceed_none_returns_false() {
+        let mut session = test_session();
+        // Agentic session starts with compact_intent = None
+        assert!(!session.take_compact_and_proceed());
+        assert!(session.chat.is_empty());
+    }
+
+    #[test]
+    fn take_compact_and_proceed_waiting_for_stream_end_returns_false() {
+        let mut session = test_session();
+        session.agentic.as_mut().unwrap().compact_intent =
+            Some(CompactIntent::ProceedAfterStreamEnd);
+        assert!(!session.take_compact_and_proceed());
+        assert!(session.chat.is_empty());
+    }
+
+    #[test]
+    fn take_compact_and_proceed_waiting_for_compaction_returns_false() {
+        let mut session = test_session();
+        session.agentic.as_mut().unwrap().compact_intent =
+            Some(CompactIntent::ProceedAfterCompaction);
+        assert!(!session.take_compact_and_proceed());
+        assert!(session.chat.is_empty());
+    }
+
+    #[test]
+    fn take_compact_and_proceed_ready_returns_true_and_pushes_message() {
+        let mut session = test_session();
+        session.agentic.as_mut().unwrap().compact_intent = Some(CompactIntent::ReadyToProceed);
+
+        assert!(session.take_compact_and_proceed());
+
+        // Should have pushed a user "Proceed" message
+        assert_eq!(session.chat.len(), 1);
+        assert!(matches!(session.chat[0], Message::User(ref s) if s.text.contains("Proceed")));
+
+        // State should be reset to None
+        assert_eq!(session.agentic.as_ref().unwrap().compact_intent, None);
+    }
+
+    #[test]
+    fn take_compact_and_proceed_only_fires_once() {
+        let mut session = test_session();
+        session.agentic.as_mut().unwrap().compact_intent = Some(CompactIntent::ReadyToProceed);
+
+        assert!(session.take_compact_and_proceed());
+        // Second call should return false — state was consumed
+        assert!(!session.take_compact_and_proceed());
+        // Only one "Proceed" message
+        assert_eq!(session.chat.len(), 1);
+    }
+
+    #[test]
+    fn compact_and_proceed_full_lifecycle() {
+        let mut session = test_session();
+        let agentic = session.agentic.as_mut().unwrap();
+
+        // 1. User clicks "Compact & Approve" → ProceedAfterStreamEnd
+        agentic.compact_intent = Some(CompactIntent::ProceedAfterStreamEnd);
+        assert!(!session.take_compact_and_proceed());
+
+        // 2. Stream ends → caller dispatches compact, sets ProceedAfterCompaction
+        let agentic = session.agentic.as_mut().unwrap();
+        assert_eq!(
+            agentic.compact_intent,
+            Some(CompactIntent::ProceedAfterStreamEnd)
+        );
+        agentic.compact_intent = Some(CompactIntent::ProceedAfterCompaction);
+        assert!(!session.take_compact_and_proceed());
+
+        // 3. Compaction completes → advance to ReadyToProceed
+        let agentic = session.agentic.as_mut().unwrap();
+        agentic.compact_intent = Some(CompactIntent::ReadyToProceed);
+
+        // 4. Compact stream ends → take_compact_and_proceed fires → sends "Proceed"
+        assert!(session.take_compact_and_proceed());
+        assert!(
+            matches!(session.chat.last(), Some(Message::User(ref s)) if s.text.contains("Proceed"))
+        );
+
+        // 5. State is back to None
+        assert_eq!(session.agentic.as_ref().unwrap().compact_intent, None);
+    }
+
+    #[test]
+    fn is_compacting_derived_from_compact_intent() {
+        let mut session = test_session();
+        let agentic = session.agentic.as_mut().unwrap();
+
+        // None → not compacting
+        agentic.compact_intent = None;
+        assert!(!agentic.is_compacting());
+
+        // Manual → compacting
+        agentic.compact_intent = Some(CompactIntent::Manual);
+        assert!(agentic.is_compacting());
+
+        // ProceedAfterStreamEnd → not yet compacting (waiting for stream end)
+        agentic.compact_intent = Some(CompactIntent::ProceedAfterStreamEnd);
+        assert!(!agentic.is_compacting());
+
+        // ProceedAfterCompaction → compacting
+        agentic.compact_intent = Some(CompactIntent::ProceedAfterCompaction);
+        assert!(agentic.is_compacting());
+
+        // ReadyToProceed → compaction finished, not compacting
+        agentic.compact_intent = Some(CompactIntent::ReadyToProceed);
+        assert!(!agentic.is_compacting());
     }
 }

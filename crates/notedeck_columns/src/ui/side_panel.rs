@@ -12,8 +12,10 @@ use crate::{
     route::Route,
 };
 
-use enostr::{RelayPool, RelayStatus};
-use notedeck::{tr, Accounts, Localization, MediaJobSender, NotedeckTextStyle, UserAccount};
+use enostr::RelayStatus;
+use notedeck::{
+    tr, Accounts, Localization, MediaJobSender, NotedeckTextStyle, RelayInspectApi, UserAccount,
+};
 use notedeck_ui::{
     anim::{AnimationHelper, ICON_EXPANSION_MULTIPLE},
     app_images, colors, ProfilePic, View,
@@ -24,7 +26,7 @@ use super::configure_deck::deck_icon;
 pub static SIDE_PANEL_WIDTH: f32 = 68.0;
 static ICON_WIDTH: f32 = 40.0;
 
-pub struct DesktopSidePanel<'a> {
+pub struct DesktopSidePanel<'r, 'a> {
     selected_account: &'a UserAccount,
     decks_cache: &'a DecksCache,
     i18n: &'a mut Localization,
@@ -32,10 +34,10 @@ pub struct DesktopSidePanel<'a> {
     img_cache: &'a mut notedeck::Images,
     jobs: &'a MediaJobSender,
     current_route: Option<&'a Route>,
-    pool: &'a RelayPool,
+    relay_inspect: RelayInspectApi<'r, 'a>,
 }
 
-impl View for DesktopSidePanel<'_> {
+impl View for DesktopSidePanel<'_, '_> {
     fn ui(&mut self, ui: &mut egui::Ui) {
         self.show(ui);
     }
@@ -70,7 +72,7 @@ impl SidePanelResponse {
     }
 }
 
-impl<'a> DesktopSidePanel<'a> {
+impl<'r, 'a> DesktopSidePanel<'r, 'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         selected_account: &'a UserAccount,
@@ -80,7 +82,7 @@ impl<'a> DesktopSidePanel<'a> {
         img_cache: &'a mut notedeck::Images,
         jobs: &'a MediaJobSender,
         current_route: Option<&'a Route>,
-        pool: &'a RelayPool,
+        relay_inspect: RelayInspectApi<'r, 'a>,
     ) -> Self {
         Self {
             selected_account,
@@ -90,7 +92,7 @@ impl<'a> DesktopSidePanel<'a> {
             img_cache,
             jobs,
             current_route,
-            pool,
+            relay_inspect,
         }
     }
 
@@ -201,7 +203,7 @@ impl<'a> DesktopSidePanel<'a> {
             // Connectivity indicator
             let connectivity_resp = ui
                 .with_layout(Layout::top_down(egui::Align::Center), |ui| {
-                    connectivity_indicator(ui, self.pool, self.current_route)
+                    connectivity_indicator(ui, &self.relay_inspect, self.current_route)
                 })
                 .inner;
 
@@ -260,7 +262,7 @@ impl<'a> DesktopSidePanel<'a> {
                         ui.painter().circle_stroke(
                             rect.center(),
                             radius + 2.0,
-                            Stroke::new(1.5, ui.visuals().text_color()),
+                            Stroke::new(notedeck::tokens::STROKE_MEDIUM, ui.visuals().text_color()),
                         );
                     }
 
@@ -507,63 +509,7 @@ fn add_column_button() -> impl Widget {
 }
 
 pub fn search_button_impl(color: egui::Color32, line_width: f32, is_active: bool) -> impl Widget {
-    move |ui: &mut egui::Ui| -> egui::Response {
-        let max_size = ICON_WIDTH * ICON_EXPANSION_MULTIPLE;
-        let min_line_width_circle = line_width;
-        let min_line_width_handle = line_width;
-        let helper = AnimationHelper::new(ui, "search-button", vec2(max_size, max_size));
-
-        let painter = ui.painter_at(helper.get_animation_rect());
-
-        if is_active {
-            let circle_radius = max_size / 2.0;
-            painter.circle(
-                helper.get_animation_rect().center(),
-                circle_radius,
-                notedeck_ui::side_panel_active_bg(ui),
-                Stroke::NONE,
-            );
-        }
-
-        let cur_line_width_circle = helper.scale_1d_pos(min_line_width_circle);
-        let cur_line_width_handle = helper.scale_1d_pos(min_line_width_handle);
-        let min_outer_circle_radius = helper.scale_radius(15.0);
-        let cur_outer_circle_radius = helper.scale_1d_pos(min_outer_circle_radius);
-        let min_handle_length = 7.0;
-        let cur_handle_length = helper.scale_1d_pos(min_handle_length);
-
-        let circle_center = helper.scale_from_center(-2.0, -2.0);
-
-        let handle_vec = vec2(
-            std::f32::consts::FRAC_1_SQRT_2,
-            std::f32::consts::FRAC_1_SQRT_2,
-        );
-
-        let handle_pos_1 = circle_center + (handle_vec * (cur_outer_circle_radius - 3.0));
-        let handle_pos_2 =
-            circle_center + (handle_vec * (cur_outer_circle_radius + cur_handle_length));
-
-        let icon_color = if is_active {
-            ui.visuals().strong_text_color()
-        } else {
-            color
-        };
-        let circle_stroke = Stroke::new(cur_line_width_circle, icon_color);
-        let handle_stroke = Stroke::new(cur_line_width_handle, icon_color);
-
-        painter.line_segment([handle_pos_1, handle_pos_2], handle_stroke);
-        painter.circle(
-            circle_center,
-            min_outer_circle_radius,
-            ui.style().visuals.widgets.inactive.weak_bg_fill,
-            circle_stroke,
-        );
-
-        helper
-            .take_animation_response()
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text("Open search")
-    }
+    notedeck_ui::icons::search_button(color, line_width, is_active)
 }
 
 pub fn search_button(current_route: Option<&Route>) -> impl Widget + '_ {
@@ -808,15 +754,15 @@ fn home_button() -> impl Widget {
 }
 fn connectivity_indicator(
     ui: &mut egui::Ui,
-    pool: &RelayPool,
+    relay_inspect: &RelayInspectApi<'_, '_>,
     _current_route: Option<&Route>,
 ) -> egui::Response {
-    let connected_count = pool
-        .relays
+    let relay_infos = relay_inspect.relay_infos();
+    let connected_count = relay_infos
         .iter()
-        .filter(|r| matches!(r.status(), RelayStatus::Connected))
+        .filter(|info| matches!(info.status, RelayStatus::Connected))
         .count();
-    let total_count = pool.relays.len();
+    let total_count = relay_infos.len();
 
     // Calculate connectivity ratio (0.0 to 1.0)
     let ratio = if total_count > 0 {
@@ -836,11 +782,7 @@ fn connectivity_indicator(
         egui::Color32::from_rgb(0xFF - (0x99 as f32 * t) as u8, 0xCC, 0x66)
     };
 
-    let inactive_color = if ui.visuals().dark_mode {
-        egui::Color32::from_rgb(60, 60, 60)
-    } else {
-        egui::Color32::from_rgb(200, 200, 200)
-    };
+    let inactive_color = notedeck::ColorTheme::current(ui.ctx()).border_default;
 
     let max_size = ICON_WIDTH * ICON_EXPANSION_MULTIPLE;
     let helper = AnimationHelper::new(ui, "connectivity-indicator", vec2(max_size, max_size));

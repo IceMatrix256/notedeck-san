@@ -18,9 +18,38 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Additional Setup (if specified)
         if: ${{ inputs.additional-setup != '' }}
         run: ${{ inputs.additional-setup }}
 
       - name: Run Tests (Native Only)
-        run: cargo test
+        run: cargo test --workspace --exclude notedeck_columns --exclude notedeck_dave --exclude notedeck_messages
+        env:
+          CI: true
+
+      - name: Run notedeck_dave Tests
+        run: cargo test -p notedeck_dave -- --test-threads=1
+        env:
+          CI: true
+
+      - name: Run notedeck_columns Unit Tests
+        run: cargo test -p notedeck_columns --lib
+        env:
+          CI: true
+
+      - name: Run notedeck_columns E2E Tests
+        run: cargo test -p notedeck_columns --test columns_e2e -- --test-threads=1
+        env:
+          CI: true
+
+      - name: Run notedeck_messages Unit Tests
+        run: cargo test -p notedeck_messages --lib
+        env:
+          CI: true
+
+      - name: Run notedeck_messages E2E Tests
+        run: cargo test -p notedeck_messages --test messages_e2e -- --test-threads=1
+        env:
+          CI: true
