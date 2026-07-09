@@ -38,38 +38,10 @@ struct HeaderAnim {
     height: f32,
 }
 
-fn toolbar_visibility_amount(ui: &mut egui::Ui) -> f32 {
-    let toolbar_visible_id = egui::Id::new("toolbar_visible");
-    let toolbar_visible = ui
-        .ctx()
-        .data(|d| d.get_temp::<bool>(toolbar_visible_id))
-        .unwrap_or(true);
-    ui.ctx()
-        .animate_bool_responsive(toolbar_visible_id.with("anim"), toolbar_visible)
-}
-
-fn header_anim(ui: &mut egui::Ui) -> Option<HeaderAnim> {
-    let base_padding = 8.0;
-    let base_height = 48.0;
-
-    let navbar_anim = toolbar_visibility_amount(ui);
-    let is_wide = !notedeck::ui::is_narrow(ui.ctx());
-
-    if is_wide {
-        // Wide mode: no animation, always show full header
-        Some(HeaderAnim {
-            padding: base_padding,
-            height: base_height,
-        })
-    } else if navbar_anim < 0.01 {
-        // Narrow mode with negligible visibility: don't render
-        None
-    } else {
-        // Narrow mode: animate
-        let height = base_height * navbar_anim;
-        let padding = base_padding * navbar_anim;
-
-        Some(HeaderAnim { padding, height })
+fn header_anim() -> HeaderAnim {
+    HeaderAnim {
+        padding: 8.0,
+        height: 48.0,
     }
 }
 
@@ -101,10 +73,7 @@ impl<'a> NavTitle<'a> {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) -> Option<RenderNavAction> {
-        // On mobile, animate navbar visibility in sync with the toolbar
-        // (toolbar_visible is set in render_damus_mobile based on scroll direction)
-
-        let anim = header_anim(ui)?;
+        let anim = header_anim();
 
         notedeck_ui::padding(anim.padding, ui, |ui| {
             let mut rect = ui.available_rect_before_wrap();
@@ -161,6 +130,9 @@ impl<'a> NavTitle<'a> {
                         ColumnsAction::Switch(from, to_index),
                     )))
                 }
+                TitleResponse::RefreshTimeline(kind) => {
+                    Some(RenderNavAction::RefreshTimeline(kind))
+                }
             }
         } else if back_button_resp.is_some_and(|r| r.clicked()) {
             tracing::debug!("render nav action back");
@@ -182,7 +154,12 @@ impl<'a> NavTitle<'a> {
         //let spacing_prev = ui.spacing().item_spacing.x;
         //ui.spacing_mut().item_spacing.x = 0.0;
 
-        let chev_resp = chevron(ui, 2.0, chev_size, Stroke::new(2.0, color));
+        let chev_resp = chevron(
+            ui,
+            notedeck::tokens::STROKE_THICK,
+            chev_size,
+            Stroke::new(notedeck::tokens::STROKE_THICK, color),
+        );
 
         //ui.spacing_mut().item_spacing.x = spacing_prev;
 
@@ -360,7 +337,10 @@ impl<'a> NavTitle<'a> {
                                         closest_index,
                                         distance,
                                     ),
-                                    egui::Stroke::new(1.0, ui.visuals().text_color()),
+                                    egui::Stroke::new(
+                                        notedeck::tokens::STROKE_THIN,
+                                        ui.visuals().text_color(),
+                                    ),
                                 );
                             }
 
@@ -383,8 +363,11 @@ impl<'a> NavTitle<'a> {
     ) -> Vec<(egui::Response, f32)> {
         let y_margin: i8 = 4;
         let item_frame = egui::Frame::new()
-            .corner_radius(egui::CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(8, y_margin));
+            .corner_radius(egui::CornerRadius::same(notedeck::tokens::RADIUS_MD as u8))
+            .inner_margin(Margin::symmetric(
+                notedeck::tokens::SPACING_SM as i8,
+                y_margin,
+            ));
 
         (0..self.columns.num_columns())
             .filter_map(|col| {
@@ -392,7 +375,10 @@ impl<'a> NavTitle<'a> {
                 let col_resp = if col == self.col_id {
                     ui.dnd_drag_source(item_id, col, |ui| {
                         item_frame
-                            .stroke(egui::Stroke::new(2.0, notedeck_ui::colors::PINK))
+                            .stroke(egui::Stroke::new(
+                                notedeck::tokens::STROKE_THICK,
+                                notedeck_ui::colors::PINK,
+                            ))
                             .fill(ui.visuals().widgets.noninteractive.bg_stroke.color)
                             .show(ui, |ui| self.move_tooltip_col_presentation(ui, col));
                     })
@@ -652,6 +638,7 @@ impl<'a> NavTitle<'a> {
             } else {
                 let mut move_col: Option<usize> = None;
                 let mut remove_col = false;
+                let mut refresh_kind: Option<TimelineKind> = None;
 
                 if self.should_show_move_button() {
                     move_col = self.move_button_section(ui);
@@ -660,12 +647,29 @@ impl<'a> NavTitle<'a> {
                     remove_col = self.delete_button_section(ui);
                 }
 
+                // Show refresh button for one-shot feeds (e.g. algo feeds)
+                if let Route::Timeline(kind) = top {
+                    if kind.needs_refresh_button() {
+                        let resp = ui
+                            .add(refresh_button())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text(tr!(
+                                self.i18n,
+                                "Refresh feed",
+                                "Tooltip for refreshing a one-shot feed"
+                            ));
+                        if resp.clicked() {
+                            refresh_kind = Some(kind.clone());
+                        }
+                    }
+                }
+
                 if let Some(col) = move_col {
                     Some(TitleResponse::MoveColumn(col))
                 } else if remove_col {
                     Some(TitleResponse::RemoveColumn)
                 } else {
-                    None
+                    refresh_kind.map(TitleResponse::RefreshTimeline)
                 }
             }
         })
@@ -700,10 +704,59 @@ enum TitleResponse {
     RemoveColumn,
     PfpClicked,
     MoveColumn(usize),
+    RefreshTimeline(TimelineKind),
 }
 
 fn prev<R>(xs: &[R]) -> Option<&R> {
     xs.get(xs.len().checked_sub(2)?)
+}
+
+fn refresh_button() -> impl egui::Widget {
+    |ui: &mut egui::Ui| -> egui::Response {
+        let max_size = egui::vec2(20.0, 20.0);
+        let helper = AnimationHelper::new(ui, "refresh-feed", max_size);
+        let rect = helper.get_animation_rect();
+        let painter = ui.painter_at(rect);
+        let center = rect.center();
+        let color = ui.style().visuals.noninteractive().fg_stroke.color;
+        let stroke = Stroke::new(helper.scale_1d_pos(1.5), color);
+        let radius = helper.scale_1d_pos(6.0);
+
+        // Draw a circular arc (~270 degrees)
+        let n_points = 20;
+        let start_angle = -std::f32::consts::FRAC_PI_2; // top
+        let sweep = std::f32::consts::PI * 1.5; // 270 degrees
+
+        let points: Vec<egui::Pos2> = (0..=n_points)
+            .map(|i| {
+                let t = i as f32 / n_points as f32;
+                let angle = start_angle + sweep * t;
+                center + egui::vec2(angle.cos(), angle.sin()) * radius
+            })
+            .collect();
+
+        painter.add(egui::Shape::line(points, stroke));
+
+        // Draw arrowhead at the end of the arc
+        let end_angle = start_angle + sweep;
+        let arrow_size = helper.scale_1d_pos(3.5);
+        let end_point = center + egui::vec2(end_angle.cos(), end_angle.sin()) * radius;
+
+        // Tangent direction at the end point (perpendicular to radius, clockwise)
+        let tangent = egui::vec2(-end_angle.sin(), end_angle.cos());
+        let normal = egui::vec2(end_angle.cos(), end_angle.sin());
+
+        let arrow_p1 = end_point - tangent * arrow_size + normal * arrow_size * 0.5;
+        let arrow_p2 = end_point - tangent * arrow_size - normal * arrow_size * 0.5;
+
+        painter.add(egui::Shape::convex_polygon(
+            vec![end_point, arrow_p1, arrow_p2],
+            color,
+            Stroke::NONE,
+        ));
+
+        helper.take_animation_response()
+    }
 }
 
 fn grab_button() -> impl egui::Widget {

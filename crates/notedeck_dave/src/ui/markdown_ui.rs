@@ -72,7 +72,7 @@ fn render_element(element: &MdElement, theme: &MdTheme, buffer: &str, ui: &mut U
             ui.horizontal_wrapped(|ui| {
                 render_inlines(inlines, theme, buffer, ui);
             });
-            ui.add_space(8.0);
+            ui.add_space(notedeck::tokens::SPACING_SM);
         }
 
         MdElement::CodeBlock(CodeBlock { language, content }) => {
@@ -87,21 +87,27 @@ fn render_element(element: &MdElement, theme: &MdTheme, buffer: &str, ui: &mut U
         MdElement::BlockQuote(nested) => {
             egui::Frame::default()
                 .fill(theme.blockquote_bg)
-                .stroke(egui::Stroke::new(2.0, theme.blockquote_border))
-                .inner_margin(egui::Margin::symmetric(8, 4))
+                .stroke(egui::Stroke::new(
+                    notedeck::tokens::STROKE_THICK,
+                    theme.blockquote_border,
+                ))
+                .inner_margin(egui::Margin::symmetric(
+                    notedeck::tokens::SPACING_SM as i8,
+                    notedeck::tokens::SPACING_XS as i8,
+                ))
                 .show(ui, |ui| {
                     for elem in nested {
                         render_element(elem, theme, buffer, ui);
                     }
                 });
-            ui.add_space(8.0);
+            ui.add_space(notedeck::tokens::SPACING_SM);
         }
 
         MdElement::UnorderedList(items) => {
             for item in items {
                 render_list_item(item, "\u{2022}", theme, buffer, ui);
             }
-            ui.add_space(8.0);
+            ui.add_space(notedeck::tokens::SPACING_SM);
         }
 
         MdElement::OrderedList { start, items } => {
@@ -109,7 +115,7 @@ fn render_element(element: &MdElement, theme: &MdTheme, buffer: &str, ui: &mut U
                 let marker = format!("{}.", start + i as u32);
                 render_list_item(item, &marker, theme, buffer, ui);
             }
-            ui.add_space(8.0);
+            ui.add_space(notedeck::tokens::SPACING_SM);
         }
 
         MdElement::Table { headers, rows } => {
@@ -118,7 +124,7 @@ fn render_element(element: &MdElement, theme: &MdTheme, buffer: &str, ui: &mut U
 
         MdElement::ThematicBreak => {
             ui.separator();
-            ui.add_space(8.0);
+            ui.add_space(notedeck::tokens::SPACING_SM);
         }
 
         MdElement::Text(span) => {
@@ -162,7 +168,7 @@ fn render_inlines(inlines: &[InlineElement], theme: &MdTheme, buffer: &str, ui: 
     let strikethrough_fmt = TextFormat {
         font_id: FontId::new(font_size, FontFamily::Proportional),
         color: text_color,
-        strikethrough: egui::Stroke::new(1.0, text_color),
+        strikethrough: egui::Stroke::new(notedeck::tokens::STROKE_THIN, text_color),
         ..Default::default()
     };
 
@@ -217,7 +223,8 @@ fn render_inlines(inlines: &[InlineElement], theme: &MdTheme, buffer: &str, ui: 
             }
 
             InlineElement::LineBreak => {
-                job.append("\n", 0.0, text_fmt.clone());
+                flush_job(&mut job, ui);
+                ui.end_row();
             }
         }
     }
@@ -226,7 +233,7 @@ fn render_inlines(inlines: &[InlineElement], theme: &MdTheme, buffer: &str, ui: 
 }
 
 /// Sand-themed syntax highlighting colors (warm, Claude-Code-esque palette)
-struct SandCodeTheme {
+pub(crate) struct SandCodeTheme {
     comment: Color32,
     keyword: Color32,
     literal: Color32,
@@ -236,7 +243,7 @@ struct SandCodeTheme {
 }
 
 impl SandCodeTheme {
-    fn from_visuals(visuals: &egui::Visuals) -> Self {
+    pub(crate) fn from_visuals(visuals: &egui::Visuals) -> Self {
         if visuals.dark_mode {
             Self {
                 comment: Color32::from_rgb(0x8A, 0x80, 0x72), // Warm gray-brown
@@ -258,7 +265,7 @@ impl SandCodeTheme {
         }
     }
 
-    fn format(&self, token: SandToken, font_id: &FontId) -> TextFormat {
+    pub(crate) fn format(&self, token: SandToken, font_id: &FontId) -> TextFormat {
         let color = match token {
             SandToken::Comment => self.comment,
             SandToken::Keyword => self.keyword,
@@ -273,7 +280,7 @@ impl SandCodeTheme {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SandToken {
+pub(crate) enum SandToken {
     Comment,
     Keyword,
     Literal,
@@ -384,7 +391,7 @@ impl<'a> LangConfig<'a> {
 
 /// Tokenize source code into (token_type, text_slice) pairs.
 /// Separated from rendering so it can be unit tested.
-fn tokenize_code<'a>(code: &'a str, language: &str) -> Vec<(SandToken, &'a str)> {
+pub(crate) fn tokenize_code<'a>(code: &'a str, language: &str) -> Vec<(SandToken, &'a str)> {
     let Some(lang) = LangConfig::from_language(language) else {
         return vec![(SandToken::Plain, code)];
     };
@@ -489,8 +496,6 @@ fn render_list_item(item: &ListItem, marker: &str, theme: &MdTheme, buffer: &str
 }
 
 fn render_table(headers: &[Span], rows: &[Vec<Span>], theme: &MdTheme, buffer: &str, ui: &mut Ui) {
-    use egui_extras::{Column, TableBuilder};
-
     let num_cols = headers.len();
     if num_cols == 0 {
         return;
@@ -500,41 +505,55 @@ fn render_table(headers: &[Span], rows: &[Vec<Span>], theme: &MdTheme, buffer: &
 
     // Use first header's byte offset as id_salt so multiple tables don't clash
     let salt = headers.first().map_or(0, |h| h.start);
-    let mut builder = TableBuilder::new(ui)
-        .id_salt(salt)
-        .vscroll(false)
-        .auto_shrink([false, false]);
-    for _ in 0..num_cols {
-        builder = builder.column(Column::auto().resizable(true));
-    }
+
+    // Cap column width to prevent overflow, but let Grid auto-size narrower.
+    let table_width = ui.available_width();
+    let spacing = ui.spacing().item_spacing.x;
+    let total_spacing = spacing * (num_cols - 1) as f32;
+    let max_col = ((table_width - total_spacing) / num_cols as f32).max(20.0);
 
     let header_bg = theme.code_bg;
 
-    builder
-        .header(28.0, |mut header| {
-            for h in headers {
-                header.col(|ui| {
-                    ui.painter().rect_filled(ui.max_rect(), 0.0, header_bg);
-                    egui::Frame::NONE.inner_margin(cell_padding).show(ui, |ui| {
-                        ui.strong(h.resolve(buffer));
-                    });
-                });
-            }
-        })
-        .body(|mut body| {
-            for row in rows {
-                body.row(28.0, |mut table_row| {
-                    for i in 0..num_cols {
-                        table_row.col(|ui| {
+    // Wrap in horizontal scroll so wide tables don't break layout on small screens.
+    // Use egui::Grid so rows auto-size to fit wrapped text content
+    // rather than truncating at a fixed height.
+    egui::ScrollArea::horizontal()
+        .id_salt(("md_table_scroll", salt))
+        .show(ui, |ui| {
+            egui::Grid::new(salt)
+                .num_columns(num_cols)
+                .max_col_width(max_col)
+                .with_row_color(
+                    move |row, _style| {
+                        if row == 0 {
+                            Some(header_bg)
+                        } else {
+                            None
+                        }
+                    },
+                )
+                .spacing([spacing, 0.0])
+                .show(ui, |ui| {
+                    // Header row
+                    for h in headers {
+                        egui::Frame::NONE.inner_margin(cell_padding).show(ui, |ui| {
+                            ui.strong(h.resolve(buffer));
+                        });
+                    }
+                    ui.end_row();
+
+                    // Data rows
+                    for row in rows {
+                        for i in 0..num_cols {
                             egui::Frame::NONE.inner_margin(cell_padding).show(ui, |ui| {
                                 if let Some(cell) = row.get(i) {
                                     ui.label(cell.resolve(buffer));
                                 }
                             });
-                        });
+                        }
+                        ui.end_row();
                     }
                 });
-            }
         });
     ui.add_space(8.0);
 }
@@ -602,6 +621,8 @@ fn render_partial(partial: &Partial, theme: &MdTheme, buffer: &str, ui: &mut Ui)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui_kittest::{kittest::Queryable, Harness};
+    use md_stream::{InlineElement, Span};
 
     /// Helper: collect (token, text) pairs
     fn tokens<'a>(code: &'a str, lang: &str) -> Vec<(SandToken, &'a str)> {
@@ -737,6 +758,34 @@ mod tests {
         // Ensure multi-byte chars don't cause panics from byte indexing
         let toks = tokens("→", "rust");
         assert_eq!(toks, vec![(SandToken::Punctuation, "→")]);
+    }
+
+    #[test]
+    fn test_hard_line_break_renders_on_a_new_row() {
+        let buffer = "alpha  \nbeta";
+        let inlines = vec![
+            InlineElement::Text(Span::new(0, 5)),
+            InlineElement::LineBreak,
+            InlineElement::Text(Span::new(8, 12)),
+        ];
+
+        let mut harness = Harness::new_ui(move |ui| {
+            let theme = MdTheme::from_visuals(ui.visuals());
+            ui.horizontal_wrapped(|ui| {
+                render_inlines(&inlines, &theme, buffer, ui);
+            });
+        });
+
+        harness.run();
+
+        let alpha = harness.get_by_label("alpha");
+        let beta = harness.get_by_label("beta");
+        let alpha_bounds = alpha.raw_bounds().expect("alpha bounds");
+        let beta_bounds = beta.raw_bounds().expect("beta bounds");
+        assert!(
+            beta_bounds.y0 > alpha_bounds.y1,
+            "hard line breaks should render the following text on a later row"
+        );
     }
 
     #[test]

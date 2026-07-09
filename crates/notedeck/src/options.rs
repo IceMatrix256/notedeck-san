@@ -11,9 +11,6 @@ bitflags! {
         /// Debug controls, fps stats
         const Debug = 1 << 1;
 
-        /// Show relay debug window?
-        const RelayDebug = 1 << 2;
-
         /// Are we running as tests?
         const Tests = 1 << 3;
 
@@ -22,6 +19,9 @@ bitflags! {
 
         /// Simulate is_compiled_as_mobile ?
         const Mobile = 1 << 6;
+
+        /// Show the native window titlebar?
+        const ShowTitle = 1 << 7;
     }
 }
 

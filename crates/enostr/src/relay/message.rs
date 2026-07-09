@@ -1,5 +1,8 @@
 use crate::{Error, Result};
 use ewebsock::{WsEvent, WsMessage};
+use serde::de::{self, IgnoredAny, SeqAccess, Visitor};
+use std::borrow::Cow;
+use std::fmt;
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct CommandResult<'a> {
@@ -8,16 +11,17 @@ pub struct CommandResult<'a> {
     message: &'a str,
 }
 
-pub fn calculate_command_result_size(result: &CommandResult) -> usize {
-    std::mem::size_of_val(result) + result.event_id.len() + result.message.len()
-}
-
 #[derive(Debug, Eq, PartialEq)]
 pub enum RelayMessage<'a> {
     OK(CommandResult<'a>),
     Eose(&'a str),
     Event(&'a str, &'a str),
     Notice(&'a str),
+    Closed(&'a str, &'a str),
+    /// NIP-77 negentropy reconciliation message: ["NEG-MSG", <sub_id>, <payload>]
+    NegMsg(Cow<'a, str>, Cow<'a, str>),
+    /// NIP-77 negentropy error: ["NEG-ERR", <sub_id>, <reason>]
+    NegErr(Cow<'a, str>, Cow<'a, str>),
 }
 
 #[derive(Debug)]
@@ -73,6 +77,11 @@ impl<'a> RelayMessage<'a> {
         RelayMessage::Event(sub_id, ev)
     }
 
+    /// Construct a relay `CLOSED` message with its subscription id and reason.
+    pub fn closed(sub_id: &'a str, message: &'a str) -> Self {
+        RelayMessage::Closed(sub_id, message)
+    }
+
     pub fn from_json(msg: &'a str) -> Result<RelayMessage<'a>> {
         if msg.is_empty() {
             return Err(Error::Empty);
@@ -99,10 +108,9 @@ impl<'a> RelayMessage<'a> {
         // Event
         // Relay response format: ["EVENT", <subscription id>, <event JSON>]
         if &msg[0..=7] == "[\"EVENT\"" {
-            let mut start = 9;
-            while let Some(&b' ') = msg.as_bytes().get(start) {
-                start += 1; // Move past optional spaces
-            }
+            let raw = &msg[9..];
+            let trimmed = raw.trim_start_matches(' ');
+            let start = msg.len() - trimmed.len();
             if let Some(comma_index) = msg[start..].find(',') {
                 let subid_end = start + comma_index;
                 let subid = &msg[start..subid_end].trim().trim_matches('"');
@@ -135,26 +143,184 @@ impl<'a> RelayMessage<'a> {
             ));
         }
 
+        // CLOSED (NIP-01)
+        // Relay response format: ["CLOSED", <subscription_id>, <message>]
+        if msg.starts_with("[\"CLOSED\"") {
+            let parts: Vec<&'a str> =
+                serde_json::from_str(msg).map_err(|err| Error::DecodeFailed(err.to_string()))?;
+            if parts.len() != 3 || parts[0] != "CLOSED" {
+                return Err(Error::DecodeFailed("Invalid CLOSED format".into()));
+            }
+
+            return Ok(Self::closed(parts[1], parts[2]));
+        }
+
         // OK (NIP-20)
         // Relay response format: ["OK",<event_id>, <true|false>, <message>]
-        if &msg[0..=5] == "[\"OK\"," && msg.len() >= 78 {
+        if &msg[0..=5] == "[\"OK\"," {
+            if msg.len() < 78 {
+                return Err(Error::DecodeFailed("Invalid OK format".into()));
+            }
+
             let event_id = &msg[7..71];
             let booly = &msg[73..77];
-            let status: bool = if booly == "true" {
-                true
-            } else if booly == "false" {
-                false
+            let (status, idx) = if booly == "true" {
+                (true, 77)
+            } else if msg[73..].starts_with("false") {
+                (false, 78)
             } else {
                 return Err(Error::DecodeFailed("bad boolean value".into()));
             };
-            let message_start = msg.rfind(',').unwrap() + 1;
-            let message = &msg[message_start..msg.len() - 2].trim().trim_matches('"');
+
+            if msg.as_bytes().get(idx).copied() != Some(b',') {
+                return Err(Error::DecodeFailed("Invalid OK format".into()));
+            }
+
+            if msg.as_bytes().get(idx + 1).copied() != Some(b'"') {
+                return Err(Error::DecodeFailed("Invalid OK format".into()));
+            }
+
+            if msg.as_bytes().get(msg.len() - 2).copied() != Some(b'"')
+                || msg.as_bytes().last().copied() != Some(b']')
+            {
+                return Err(Error::DecodeFailed("Invalid OK format".into()));
+            }
+
+            let message = &msg[(idx + 2)..(msg.len() - 2)];
+
             return Ok(Self::ok(event_id, status, message));
+        }
+
+        if is_nip77_frame(msg) {
+            return parse_nip77_frame(msg);
         }
 
         Err(Error::DecodeFailed(format!(
             "unrecognized message type: '{msg}'"
         )))
+    }
+}
+
+/// Parse one NIP-77 relay frame as a JSON array and validate its arity.
+fn parse_nip77_frame<'a>(msg: &'a str) -> Result<RelayMessage<'a>> {
+    match serde_json::from_str::<Nip77Frame<'a>>(msg) {
+        Ok(Nip77Frame::NegMsg(sub_id, payload)) => Ok(RelayMessage::NegMsg(sub_id, payload)),
+        Ok(Nip77Frame::NegErr(sub_id, reason)) => Ok(RelayMessage::NegErr(sub_id, reason)),
+        Err(err) => {
+            let err = err.to_string();
+            if err.contains("Invalid NEG-MSG format") {
+                return Err(Error::DecodeFailed("Invalid NEG-MSG format".into()));
+            }
+            if err.contains("Invalid NEG-ERR format") {
+                return Err(Error::DecodeFailed("Invalid NEG-ERR format".into()));
+            }
+            Err(Error::DecodeFailed(err))
+        }
+    }
+}
+
+fn is_nip77_frame(msg: &str) -> bool {
+    matches!(first_json_array_command(msg), Some("NEG-MSG" | "NEG-ERR"))
+}
+
+fn first_json_array_command(msg: &str) -> Option<&str> {
+    let msg = msg.trim_start();
+    let msg = msg.strip_prefix('[')?.trim_start();
+    let msg = msg.strip_prefix('"')?;
+    let end = msg.find('"')?;
+    Some(&msg[..end])
+}
+
+enum Nip77Frame<'a> {
+    NegMsg(Cow<'a, str>, Cow<'a, str>),
+    NegErr(Cow<'a, str>, Cow<'a, str>),
+}
+
+impl<'de> serde::Deserialize<'de> for Nip77Frame<'de> {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(Nip77FrameVisitor)
+    }
+}
+
+struct Nip77FrameVisitor;
+
+impl<'de> Visitor<'de> for Nip77FrameVisitor {
+    type Value = Nip77Frame<'de>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a relay JSON array")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let Some(command) = seq.next_element::<&'de str>()? else {
+            return Err(de::Error::custom("Invalid NIP-77 format"));
+        };
+
+        match command {
+            "NEG-MSG" => parse_neg_msg_seq(&mut seq),
+            "NEG-ERR" => parse_neg_err_seq(&mut seq),
+            _ => Err(de::Error::custom("Invalid NIP-77 format")),
+        }
+    }
+}
+
+fn parse_neg_msg_seq<'de, A>(seq: &mut A) -> std::result::Result<Nip77Frame<'de>, A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    let sub_id = next_required_string(seq, "Invalid NEG-MSG format")?;
+    let payload = next_required_string(seq, "Invalid NEG-MSG format")?;
+    if seq.next_element::<IgnoredAny>()?.is_some() {
+        return Err(de::Error::custom("Invalid NEG-MSG format"));
+    }
+
+    Ok(Nip77Frame::NegMsg(sub_id, payload))
+}
+
+fn parse_neg_err_seq<'de, A>(seq: &mut A) -> std::result::Result<Nip77Frame<'de>, A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    let sub_id = next_required_string(seq, "Invalid NEG-ERR format")?;
+    let reason = next_required_string(seq, "Invalid NEG-ERR format")?;
+    let _max_records = seq
+        .next_element::<NegErrMaxRecords>()
+        .map_err(|_| de::Error::custom("Invalid NEG-ERR format"))?;
+    if seq.next_element::<IgnoredAny>()?.is_some() {
+        return Err(de::Error::custom("Invalid NEG-ERR format"));
+    }
+
+    Ok(Nip77Frame::NegErr(sub_id, reason))
+}
+
+fn next_required_string<'de, A>(
+    seq: &mut A,
+    error: &'static str,
+) -> std::result::Result<Cow<'de, str>, A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    seq.next_element::<Cow<'de, str>>()
+        .map_err(|_| de::Error::custom(error))?
+        .ok_or_else(|| de::Error::custom(error))
+}
+
+struct NegErrMaxRecords;
+
+impl<'de> serde::Deserialize<'de> for NegErrMaxRecords {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <u64 as serde::Deserialize>::deserialize(deserializer)
+            .map(|_| Self)
+            .map_err(|_| de::Error::custom("Invalid NEG-ERR format"))
     }
 }
 
@@ -200,11 +366,26 @@ mod tests {
                 Ok(RelayMessage::eose("random-subscription-id")),
             ),
             (
+                r#"["CLOSED","sub1","error: shutting down idle subscription"]"#,
+                Ok(RelayMessage::closed(
+                    "sub1",
+                    "error: shutting down idle subscription",
+                )),
+            ),
+            (
                 r#"["OK","b1a649ebe8b435ec71d3784793f3bbf4b93e64e17568a741aecd4c7ddeafce30",true,"pow: difficulty 25>=24"]"#,
                 Ok(RelayMessage::ok(
                     "b1a649ebe8b435ec71d3784793f3bbf4b93e64e17568a741aecd4c7ddeafce30",
                     true,
                     "pow: difficulty 25>=24",
+                )),
+            ),
+            (
+                r#"["OK","b1a649ebe8b435ec71d3784793f3bbf4b93e64e17568a741aecd4c7ddeafce30",false,"contains comma, and escaped quote \"x\""]"#,
+                Ok(RelayMessage::ok(
+                    "b1a649ebe8b435ec71d3784793f3bbf4b93e64e17568a741aecd4c7ddeafce30",
+                    false,
+                    r#"contains comma, and escaped quote \"x\""#,
                 )),
             ),
             // Invalid cases
@@ -222,15 +403,17 @@ mod tests {
             ),
             (
                 r#"["NOTICE": 404]"#,
-                Err(Error::DecodeFailed("unrecognized message type: '[\"NOTICE\": 404]'".into())),
+                Err(Error::DecodeFailed(
+                    "unrecognized message type: '[\"NOTICE\": 404]'".into(),
+                )),
             ),
             (
                 r#"["OK","event_id"]"#,
-                Err(Error::DecodeFailed("unrecognized message type: '[\"OK\",\"event_id\"]'".into())),
+                Err(Error::DecodeFailed("Invalid OK format".into())),
             ),
             (
                 r#"["OK","b1a649ebe8b435ec71d3784793f3bbf4b93e64e17568a741aecd4c7ddeafce30"]"#,
-                Err(Error::DecodeFailed("unrecognized message type: '[\"OK\",\"b1a649ebe8b435ec71d3784793f3bbf4b93e64e17568a741aecd4c7ddeafce30\"]'".into())),
+                Err(Error::DecodeFailed("Invalid OK format".into())),
             ),
             (
                 r#"["OK","b1a649ebe8b435ec71d3784793f3bbf4b93e64e17568a741aecd4c7ddeafce30",hello,""]"#,
@@ -239,6 +422,68 @@ mod tests {
             (
                 r#"["OK","b1a649ebe8b435ec71d3784793f3bbf4b93e64e17568a741aecd4c7ddeafce30",hello,404]"#,
                 Err(Error::DecodeFailed("bad boolean value".into())),
+            ),
+            (
+                r#"["CLOSED","sub1"]"#,
+                Err(Error::DecodeFailed("Invalid CLOSED format".into())),
+            ),
+            // NEG-MSG (NIP-77)
+            (
+                r#"["NEG-MSG","neg-sub-1","abcdef0123"]"#,
+                Ok(RelayMessage::NegMsg(
+                    "neg-sub-1".into(),
+                    "abcdef0123".into(),
+                )),
+            ),
+            (
+                r#"[ "NEG-MSG", "neg-sub-1", "abcdef0123" ]"#,
+                Ok(RelayMessage::NegMsg(
+                    "neg-sub-1".into(),
+                    "abcdef0123".into(),
+                )),
+            ),
+            // NEG-ERR (NIP-77)
+            (
+                r#"["NEG-ERR","neg-sub-1","RESULTS_TOO_BIG"]"#,
+                Ok(RelayMessage::NegErr(
+                    "neg-sub-1".into(),
+                    "RESULTS_TOO_BIG".into(),
+                )),
+            ),
+            (
+                r#"[ "NEG-ERR", "neg-sub-1", "RESULTS_TOO_BIG" ]"#,
+                Ok(RelayMessage::NegErr(
+                    "neg-sub-1".into(),
+                    "RESULTS_TOO_BIG".into(),
+                )),
+            ),
+            (
+                r#"["NEG-ERR","neg-sub-1","blocked: too many records",1000]"#,
+                Ok(RelayMessage::NegErr(
+                    "neg-sub-1".into(),
+                    "blocked: too many records".into(),
+                )),
+            ),
+            (
+                r#"["NEG-ERR","neg-sub-1","blocked: \"too broad\""]"#,
+                Ok(RelayMessage::NegErr(
+                    "neg-sub-1".into(),
+                    r#"blocked: "too broad""#.into(),
+                )),
+            ),
+            // Invalid NEG-MSG
+            (
+                r#"["NEG-MSG","sub1"]"#,
+                Err(Error::DecodeFailed("Invalid NEG-MSG format".into())),
+            ),
+            // Invalid NEG-ERR
+            (
+                r#"["NEG-ERR","neg-sub-1","blocked: too many records",1000,"extra"]"#,
+                Err(Error::DecodeFailed("Invalid NEG-ERR format".into())),
+            ),
+            (
+                r#"["NEG-ERR","neg-sub-1","blocked: too many records","1000"]"#,
+                Err(Error::DecodeFailed("Invalid NEG-ERR format".into())),
             ),
         ];
 
@@ -255,7 +500,7 @@ mod tests {
                 Err(expected_err) => {
                     let result = RelayMessage::from_json(input);
                     assert!(
-                        matches!(result, Err(ref e) if *e.to_string() == expected_err.to_string()),
+                        matches!(result, Err(ref e) if e.to_string() == expected_err.to_string()),
                         "Expected error {:?} for input: {}, but got: {:?}",
                         expected_err,
                         input,

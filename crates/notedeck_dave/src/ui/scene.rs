@@ -165,7 +165,7 @@ impl AgentScene {
                         let keybind_number = keybind_idx + 1; // 1-indexed for display
                         let position = agentic.scene_position;
                         let status = session.status();
-                        let title = &session.details.title;
+                        let title = session.details.display_title();
                         let is_selected = selected_ids.contains(&id);
                         let queue_priority = focus_queue.get_session_priority(id);
 
@@ -312,7 +312,10 @@ impl AgentScene {
             painter.rect_stroke(
                 rect,
                 0.0,
-                egui::Stroke::new(1.0, Color32::from_rgb(100, 150, 255)),
+                egui::Stroke::new(
+                    notedeck::tokens::STROKE_THIN,
+                    Color32::from_rgb(100, 150, 255),
+                ),
                 egui::StrokeKind::Outside,
             );
         }

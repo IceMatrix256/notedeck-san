@@ -39,6 +39,7 @@ impl TimelineUnits {
     }
 
     /// returns number of new entries merged
+    #[profiling::function]
     pub fn merge_new_notes<'a>(
         &mut self,
         payloads: Vec<&'a NotePayload>,
@@ -86,6 +87,15 @@ impl TimelineUnits {
 pub struct MergeResponse<'a> {
     pub insertion_response: InsertManyResponse,
     pub tl_response: Option<UnknownPks<'a>>,
+}
+
+impl<'a> MergeResponse<'a> {
+    pub fn empty() -> Self {
+        Self {
+            insertion_response: InsertManyResponse::Zero,
+            tl_response: None,
+        }
+    }
 }
 
 pub struct UnknownPks<'a> {

@@ -4,9 +4,11 @@
 //! mixed content (text + tool_use blocks) are split into separate events.
 //! Events are threaded using NIP-10 `e` tags with root/reply markers.
 
+use crate::config::{RunConfig, AI_RUN_CONFIG_KIND};
 use crate::session_jsonl::{self, ContentBlock, JsonlLine};
 use nostrdb::{NoteBuildOptions, NoteBuilder};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 /// Nostr event kind for AI conversation notes.
 pub const AI_CONVERSATION_KIND: u32 = 1988;
@@ -20,6 +22,11 @@ pub const AI_SOURCE_DATA_KIND: u32 = 1989;
 /// One event per session, auto-replaced by nostrdb on update.
 /// `d` tag = claude_session_id.
 pub const AI_SESSION_STATE_KIND: u32 = 31988;
+
+/// Nostr event kind for AI session commands (parameterized replaceable, NIP-33).
+/// Fire-and-forget commands to create sessions on remote hosts.
+/// `d` tag = command UUID.
+pub const AI_SESSION_COMMAND_KIND: u32 = 31989;
 
 /// Extract the value of a named tag from a note.
 pub fn get_tag_value<'a>(note: &'a nostrdb::Note<'a>, tag_name: &str) -> Option<&'a str> {
@@ -553,18 +560,99 @@ pub fn build_live_event(
 /// requests and respond. Tags include `perm-id` (UUID), `tool-name`, and
 /// `t: ai-permission` for filtering.
 ///
-/// Does NOT participate in threading — permission events are ancillary.
+/// Maximum serialized size for tool_input in permission request events.
+/// Keeps the final PNS-wrapped event well under typical relay limits
+/// (~64KB). Budget: 40KB content + ~500B inner event overhead + ~500B
+/// PNS outer overhead, with 1.33x base64 expansion ≈ 54KB total.
+const MAX_TOOL_INPUT_BYTES: usize = 40_000;
+
+/// Truncate large string values in a tool_input JSON object so that the
+/// serialized result fits within `max_bytes`.
+///
+/// Only modifies top-level string fields in an Object value.  Fields are
+/// truncated proportionally based on how much they exceed their share of
+/// the budget.  A `"_truncated": true` flag is added when any field is
+/// shortened.
+fn truncate_tool_input(tool_input: &serde_json::Value, max_bytes: usize) -> serde_json::Value {
+    use serde_json::Value;
+
+    let serialized = serde_json::to_string(tool_input).unwrap_or_default();
+    if serialized.len() <= max_bytes {
+        return tool_input.clone();
+    }
+
+    let obj = match tool_input.as_object() {
+        Some(o) => o,
+        None => return tool_input.clone(),
+    };
+
+    // Collect string field names sorted largest-first so we know what to trim
+    let mut string_fields: Vec<(&str, usize)> = obj
+        .iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.as_str(), s.len())))
+        .collect();
+    string_fields.sort_by(|a, b| b.1.cmp(&a.1));
+
+    if string_fields.is_empty() {
+        return tool_input.clone();
+    }
+
+    let excess = serialized.len() - max_bytes;
+    let suffix = "\n... (truncated)";
+    let suffix_len = suffix.len();
+    // Safety margin for JSON escaping differences and the added _truncated field
+    let trim_target = excess + suffix_len * string_fields.len() + 64;
+
+    // Distribute the trim proportionally among string fields
+    let total_string_bytes: usize = string_fields.iter().map(|(_, len)| len).sum();
+    let mut trim_amounts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (key, len) in &string_fields {
+        let share = (*len as f64 / total_string_bytes as f64 * trim_target as f64).ceil() as usize;
+        trim_amounts.insert(key, share.min(*len));
+    }
+
+    let mut result = serde_json::Map::new();
+    let mut did_truncate = false;
+    for (key, val) in obj {
+        if let Some(s) = val.as_str() {
+            let trim = trim_amounts.get(key.as_str()).copied().unwrap_or(0);
+            if trim > 0 && s.len() > suffix_len + trim {
+                let keep = s.len() - trim;
+                let cut = notedeck::abbrev::floor_char_boundary(s, keep);
+                let truncated = format!("{}{}", &s[..cut], suffix);
+                result.insert(key.clone(), Value::String(truncated));
+                did_truncate = true;
+            } else {
+                result.insert(key.clone(), val.clone());
+            }
+        } else {
+            result.insert(key.clone(), val.clone());
+        }
+    }
+
+    if did_truncate {
+        result.insert("_truncated".to_string(), Value::Bool(true));
+    }
+    Value::Object(result)
+}
+
+/// Participates in threading so that permission events are correctly
+/// ordered relative to tool_call / assistant events when reconstructed.
 pub fn build_permission_request_event(
     perm_id: &uuid::Uuid,
     tool_name: &str,
     tool_input: &serde_json::Value,
     session_id: &str,
+    threading: &mut ThreadingState,
     secret_key: &[u8; 32],
 ) -> Result<BuiltEvent, EventBuildError> {
-    // Content is a JSON summary for display on remote clients
+    // Truncate large string values so the event fits within relay size
+    // limits after PNS wrapping.  The local UI keeps the full tool_input.
+    let tool_input_for_event = truncate_tool_input(tool_input, MAX_TOOL_INPUT_BYTES);
+
     let content = serde_json::json!({
         "tool_name": tool_name,
-        "tool_input": tool_input,
+        "tool_input": tool_input_for_event,
     })
     .to_string();
 
@@ -574,6 +662,10 @@ pub fn build_permission_request_event(
 
     // Session identity
     builder = builder.start_tag().tag_str("d").tag_str(session_id);
+
+    // Sequence number (monotonic, for unambiguous ordering)
+    let seq_str = threading.seq.to_string();
+    builder = builder.start_tag().tag_str("seq").tag_str(&seq_str);
 
     // Permission-specific tags
     builder = builder.start_tag().tag_str("perm-id").tag_str(&perm_id_str);
@@ -591,7 +683,9 @@ pub fn build_permission_request_event(
     builder = builder.start_tag().tag_str("t").tag_str("ai-conversation");
     builder = builder.start_tag().tag_str("t").tag_str("ai-permission");
 
-    finalize_built_event(builder, secret_key, AI_CONVERSATION_KIND)
+    let event = finalize_built_event(builder, secret_key, AI_CONVERSATION_KIND)?;
+    threading.record(None, event.note_id, false);
+    Ok(event)
 }
 
 /// Build a kind-1988 permission response event.
@@ -607,12 +701,16 @@ pub fn build_permission_response_event(
     request_note_id: &[u8; 32],
     allowed: bool,
     message: Option<&str>,
+    cancel_turn: bool,
     session_id: &str,
     secret_key: &[u8; 32],
 ) -> Result<BuiltEvent, EventBuildError> {
+    // Keep the legacy `interrupt` key on the wire for compatibility with
+    // sessions that may still decode the earlier payload shape.
     let content = serde_json::json!({
         "decision": if allowed { "allow" } else { "deny" },
         "message": message.unwrap_or(""),
+        "interrupt": cancel_turn,
     })
     .to_string();
 
@@ -644,31 +742,100 @@ pub fn build_permission_response_event(
     finalize_built_event(builder, secret_key, AI_CONVERSATION_KIND)
 }
 
+/// Decode a permission response from its JSON content string.
+///
+/// Returns the decision as a `PermissionResponseType` and an optional
+/// human-readable message plus whether the denial should interrupt the
+/// current turn. Defaults to `Denied`/`false` if the content cannot be
+/// parsed or has no `"decision"` field.
+pub fn decode_permission_response(
+    content: &str,
+) -> (
+    crate::messages::PermissionResponseType,
+    Option<String>,
+    bool,
+) {
+    use crate::messages::PermissionResponseType;
+
+    match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(v) => {
+            let allowed = v.get("decision").and_then(|d| d.as_str()).unwrap_or("deny") == "allow";
+            let message = v
+                .get("message")
+                .and_then(|m| m.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            let cancel_turn = v
+                .get("interrupt")
+                .and_then(|i| i.as_bool())
+                .unwrap_or(false);
+            let response_type = if allowed {
+                PermissionResponseType::Allowed
+            } else {
+                PermissionResponseType::Denied
+            };
+            (response_type, message, cancel_turn)
+        }
+        Err(_) => (PermissionResponseType::Denied, None, false),
+    }
+}
+
 /// Build a kind-31988 session state event (parameterized replaceable).
 ///
 /// Published on every status change so remote clients and startup restore
 /// can discover active sessions. nostrdb auto-replaces older versions
 /// with same (kind, pubkey, d-tag).
+#[allow(clippy::too_many_arguments)]
 pub fn build_session_state_event(
-    claude_session_id: &str,
+    event_session_id: &str,
     title: &str,
+    custom_title: Option<&str>,
     cwd: &str,
     status: &str,
+    indicator: Option<&str>,
     hostname: &str,
     home_dir: &str,
+    backend: &str,
+    permission_mode: &str,
+    cli_session_id: Option<&str>,
+    spawn_id: Option<&str>,
     secret_key: &[u8; 32],
 ) -> Result<BuiltEvent, EventBuildError> {
     let mut builder = init_note_builder(AI_SESSION_STATE_KIND, "", Some(now_secs()));
 
     // Session identity (makes this a parameterized replaceable event)
-    builder = builder.start_tag().tag_str("d").tag_str(claude_session_id);
+    builder = builder.start_tag().tag_str("d").tag_str(event_session_id);
 
     // Session metadata as tags
     builder = builder.start_tag().tag_str("title").tag_str(title);
+    if let Some(ct) = custom_title {
+        builder = builder.start_tag().tag_str("custom_title").tag_str(ct);
+    }
     builder = builder.start_tag().tag_str("cwd").tag_str(cwd);
     builder = builder.start_tag().tag_str("status").tag_str(status);
+    if let Some(ind) = indicator {
+        builder = builder.start_tag().tag_str("indicator").tag_str(ind);
+    }
     builder = builder.start_tag().tag_str("hostname").tag_str(hostname);
     builder = builder.start_tag().tag_str("home_dir").tag_str(home_dir);
+    builder = builder.start_tag().tag_str("backend").tag_str(backend);
+    builder = builder
+        .start_tag()
+        .tag_str("permission-mode")
+        .tag_str(permission_mode);
+
+    // Real Claude CLI session ID for backend --resume.
+    // Empty string means the backend hasn't started yet.
+    // Absent (old events) means the d-tag itself is the CLI ID.
+    builder = builder
+        .start_tag()
+        .tag_str("cli_session")
+        .tag_str(cli_session_id.unwrap_or(""));
+
+    // Spawn command UUID linking this session to the request that created it.
+    if let Some(sid) = spawn_id {
+        builder = builder.start_tag().tag_str("spawn_id").tag_str(sid);
+    }
 
     // Discoverability
     builder = builder.start_tag().tag_str("t").tag_str("ai-session-state");
@@ -681,9 +848,175 @@ pub fn build_session_state_event(
     finalize_built_event(builder, secret_key, AI_SESSION_STATE_KIND)
 }
 
+/// Build a kind-31989 spawn command event.
+///
+/// This is a fire-and-forget command that tells a remote host to create a new
+/// session. The target host discovers the command via its ndb subscription,
+/// creates the session locally, and publishes a kind-31988 state event.
+pub fn build_spawn_command_event(
+    target_host: &str,
+    cwd: &str,
+    backend: &str,
+    spawn_id: &str,
+    secret_key: &[u8; 32],
+) -> Result<BuiltEvent, EventBuildError> {
+    let command_id = uuid::Uuid::new_v4().to_string();
+    let mut builder = init_note_builder(AI_SESSION_COMMAND_KIND, "", Some(now_secs()));
+
+    builder = builder.start_tag().tag_str("d").tag_str(&command_id);
+    builder = builder
+        .start_tag()
+        .tag_str("command")
+        .tag_str("spawn_session");
+    builder = builder
+        .start_tag()
+        .tag_str("target_host")
+        .tag_str(target_host);
+    builder = builder.start_tag().tag_str("cwd").tag_str(cwd);
+    builder = builder.start_tag().tag_str("backend").tag_str(backend);
+    builder = builder.start_tag().tag_str("spawn_id").tag_str(spawn_id);
+    builder = builder
+        .start_tag()
+        .tag_str("t")
+        .tag_str("ai-session-command");
+    builder = builder
+        .start_tag()
+        .tag_str("source")
+        .tag_str("notedeck-dave");
+
+    finalize_built_event(builder, secret_key, AI_SESSION_COMMAND_KIND)
+}
+
+/// Build a kind-31991 run-config event (parameterized replaceable, NIP-33).
+///
+/// One event per individual config. The d-tag is the config's stable UUID,
+/// which survives renames, command edits, reloads, and cross-device sync.
+pub(crate) fn build_run_config_event(
+    config: &RunConfig,
+    cwd: &str,
+    hostname: &str,
+    secret_key: &[u8; 32],
+) -> Result<BuiltEvent, EventBuildError> {
+    let mut builder = init_note_builder(AI_RUN_CONFIG_KIND, "", None);
+
+    builder = builder.start_tag().tag_str("d").tag_str(&config.id);
+    builder = builder.start_tag().tag_str("cwd").tag_str(cwd);
+    builder = builder.start_tag().tag_str("hostname").tag_str(hostname);
+    builder = builder.start_tag().tag_str("name").tag_str(&config.name);
+    builder = builder
+        .start_tag()
+        .tag_str("command")
+        .tag_str(&config.command);
+
+    finalize_built_event(builder, secret_key, AI_RUN_CONFIG_KIND)
+}
+
+/// Build a tombstone kind-31991 event to delete a run config.
+///
+/// Publishes an event with the same d-tag (config UUID) but with a `deleted`
+/// tag. This replaces the live config in nostrdb via NIP-33.
+pub(crate) fn build_run_config_delete_event(
+    config_id: &str,
+    cwd: &str,
+    hostname: &str,
+    secret_key: &[u8; 32],
+) -> Result<BuiltEvent, EventBuildError> {
+    let mut builder = init_note_builder(AI_RUN_CONFIG_KIND, "", None);
+
+    builder = builder.start_tag().tag_str("d").tag_str(config_id);
+    builder = builder.start_tag().tag_str("cwd").tag_str(cwd);
+    builder = builder.start_tag().tag_str("hostname").tag_str(hostname);
+    builder = builder.start_tag().tag_str("deleted").tag_str("true");
+
+    finalize_built_event(builder, secret_key, AI_RUN_CONFIG_KIND)
+}
+
+/// Parse a kind-31991 run-config note into a single `RunConfig`.
+///
+/// Returns `None` if this is a tombstone (has `deleted` tag) or if
+/// required tags (`d`, `cwd`, `name`, `command`) are missing.
+pub(crate) fn parse_run_config_event(note: &nostrdb::Note) -> Option<(PathBuf, RunConfig)> {
+    // Tombstone — treat as deleted
+    if get_tag_value(note, "deleted").is_some() {
+        return None;
+    }
+    let id = get_tag_value(note, "d")?.to_string();
+    let cwd = get_tag_value(note, "cwd")?;
+    if cwd.is_empty() {
+        return None;
+    }
+    let name = get_tag_value(note, "name")
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let command = get_tag_value(note, "command")
+        .filter(|s| !s.is_empty())?
+        .to_string();
+
+    Some((
+        PathBuf::from(cwd),
+        RunConfig {
+            id,
+            name,
+            command,
+            updated_at: note.created_at(),
+        },
+    ))
+}
+
+/// Extract the d-tag from a kind-31991 note. Used to identify tombstones
+/// so the caller can remove the config by ID even when `parse_run_config_event`
+/// returns `None`.
+pub(crate) fn run_config_event_id(note: &nostrdb::Note) -> Option<String> {
+    get_tag_value(note, "d").map(|s| s.to_string())
+}
+
+/// Check whether a kind-31991 note is a deletion tombstone.
+pub(crate) fn is_run_config_deleted(note: &nostrdb::Note) -> bool {
+    get_tag_value(note, "deleted").is_some()
+}
+
+/// Build a kind-1988 command event to set permission mode on a remote session.
+///
+/// Published by remote observers to request a permission mode change on the host.
+/// The host subscribes for these and applies them via its local backend.
+pub fn build_set_permission_mode_event(
+    mode: &str,
+    session_id: &str,
+    secret_key: &[u8; 32],
+) -> Result<BuiltEvent, EventBuildError> {
+    let content = serde_json::json!({
+        "mode": mode,
+    })
+    .to_string();
+
+    let mut builder = init_note_builder(AI_CONVERSATION_KIND, &content, Some(now_secs()));
+
+    builder = builder.start_tag().tag_str("d").tag_str(session_id);
+    builder = builder
+        .start_tag()
+        .tag_str("role")
+        .tag_str("set_permission_mode");
+    builder = builder
+        .start_tag()
+        .tag_str("source")
+        .tag_str("notedeck-dave");
+    builder = builder.start_tag().tag_str("t").tag_str("ai-conversation");
+    builder = builder.start_tag().tag_str("t").tag_str("ai-command");
+
+    finalize_built_event(builder, secret_key, AI_CONVERSATION_KIND)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_config() -> nostrdb::Config {
+        if cfg!(target_os = "windows") {
+            nostrdb::Config::new().set_mapsize(32 * 1024 * 1024)
+        } else {
+            nostrdb::Config::new()
+        }
+    }
 
     // Test secret key (32 bytes, not for real use)
     fn test_secret_key() -> [u8; 32] {
@@ -843,7 +1176,7 @@ mod tests {
 
     #[test]
     fn test_seq_counter_increments() {
-        let lines = vec![
+        let lines = [
             r#"{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"s","timestamp":"2026-02-09T20:00:00Z","cwd":"/tmp","version":"2.0.64","message":{"role":"user","content":"hello"}}"#,
             r#"{"type":"assistant","uuid":"u2","parentUuid":"u1","sessionId":"s","timestamp":"2026-02-09T20:00:01Z","cwd":"/tmp","version":"2.0.64","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#,
         ];
@@ -929,7 +1262,7 @@ mod tests {
     #[tokio::test]
     async fn test_full_roundtrip() {
         use crate::session_reconstructor;
-        use nostrdb::{Config, IngestMetadata, Ndb, Transaction};
+        use nostrdb::{IngestMetadata, Ndb, Transaction};
         use serde_json::Value;
         use tempfile::TempDir;
 
@@ -944,7 +1277,7 @@ mod tests {
 
         // Set up ndb
         let tmp_dir = TempDir::new().unwrap();
-        let ndb = Ndb::new(tmp_dir.path().to_str().unwrap(), &Config::new()).unwrap();
+        let ndb = Ndb::new(tmp_dir.path().to_str().unwrap(), &test_config()).unwrap();
 
         // Build and ingest events one at a time, waiting for each
         let sk = test_secret_key();
@@ -959,7 +1292,7 @@ mod tests {
             let line = JsonlLine::parse(line_str).unwrap();
             let events = build_events(&line, &mut threading, &sk).unwrap();
             for event in &events {
-                let sub_id = ndb.subscribe(&[filter.clone()]).unwrap();
+                let sub_id = ndb.subscribe(std::slice::from_ref(&filter)).unwrap();
                 ndb.process_event_with(&event.to_event_json(), IngestMetadata::new().client(true))
                     .expect("ingest failed");
                 let _keys = ndb.wait_for_notes(sub_id, 1).await.unwrap();
@@ -1009,7 +1342,7 @@ mod tests {
         // file-history-snapshot lines lack sessionId and top-level timestamp.
         // They should inherit session_id from a prior line and get timestamp
         // from snapshot.timestamp.
-        let lines = vec![
+        let lines = [
             r#"{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"ctx-test","timestamp":"2026-02-09T20:00:00Z","cwd":"/tmp","version":"2.0.64","message":{"role":"user","content":"hello"}}"#,
             r#"{"type":"file-history-snapshot","messageId":"abc","snapshot":{"messageId":"abc","trackedFileBackups":{},"timestamp":"2026-02-11T01:29:31.555Z"},"isSnapshotUpdate":false}"#,
         ];
@@ -1038,10 +1371,19 @@ mod tests {
         let perm_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let tool_input = serde_json::json!({"command": "rm -rf /tmp/test"});
         let sk = test_secret_key();
+        let mut threading = ThreadingState::new();
+        // Simulate some prior events so seq is non-zero
+        threading.seq = 5;
 
-        let event =
-            build_permission_request_event(&perm_id, "Bash", &tool_input, "sess-perm-test", &sk)
-                .unwrap();
+        let event = build_permission_request_event(
+            &perm_id,
+            "Bash",
+            &tool_input,
+            "sess-perm-test",
+            &mut threading,
+            &sk,
+        )
+        .unwrap();
 
         assert_eq!(event.kind, AI_CONVERSATION_KIND);
 
@@ -1052,11 +1394,69 @@ mod tests {
         assert!(json.contains(r#""role","permission_request"#));
         // Has session identity
         assert!(json.contains(r#""d","sess-perm-test"#));
+        // Has seq tag for ordering
+        assert!(json.contains(r#""seq","5"#));
         // Has discoverability tags
         assert!(json.contains(r#""t","ai-conversation"#));
         assert!(json.contains(r#""t","ai-permission"#));
         // Content has tool info
         assert!(json.contains("rm -rf"));
+        // Threading state should have advanced
+        assert_eq!(threading.seq(), 6);
+    }
+
+    #[test]
+    fn test_truncate_tool_input_small() {
+        // Small input should pass through unchanged
+        let input = serde_json::json!({"command": "ls -la"});
+        let result = truncate_tool_input(&input, 1000);
+        assert_eq!(input, result);
+        assert!(result.get("_truncated").is_none());
+    }
+
+    #[test]
+    fn test_truncate_tool_input_large_edit() {
+        // Large edit should be truncated
+        let big_old = "x".repeat(30_000);
+        let big_new = "y".repeat(30_000);
+        let input = serde_json::json!({
+            "file_path": "/some/file.rs",
+            "old_string": big_old,
+            "new_string": big_new,
+        });
+        let result = truncate_tool_input(&input, 40_000);
+
+        // Should fit within budget
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(serialized.len() <= 40_000, "got {} bytes", serialized.len());
+
+        // Should be marked as truncated
+        assert_eq!(
+            result.get("_truncated").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        // file_path should be preserved
+        assert_eq!(
+            result.get("file_path").and_then(|v| v.as_str()),
+            Some("/some/file.rs")
+        );
+
+        // Truncated fields should end with the suffix
+        let old = result.get("old_string").and_then(|v| v.as_str()).unwrap();
+        assert!(old.ends_with("... (truncated)"));
+    }
+
+    #[test]
+    fn test_truncate_tool_input_utf8_boundary() {
+        // Multibyte chars should not be split
+        let big = "\u{1F600}".repeat(10_000); // 4-byte emoji repeated
+        let input = serde_json::json!({"content": big});
+        let result = truncate_tool_input(&input, 1000);
+
+        let content = result.get("content").and_then(|v| v.as_str()).unwrap();
+        // Should be valid UTF-8 (this would panic if not)
+        assert!(content.ends_with("... (truncated)"));
     }
 
     #[test]
@@ -1071,6 +1471,7 @@ mod tests {
             &request_note_id,
             true,
             Some("looks safe"),
+            false,
             "sess-perm-test",
             &sk,
         )
@@ -1099,6 +1500,7 @@ mod tests {
             &request_note_id,
             false,
             Some("too dangerous"),
+            true,
             "sess-perm-test",
             &sk,
         )
@@ -1107,6 +1509,25 @@ mod tests {
         let json = &event.note_json;
         assert!(json.contains("deny"));
         assert!(json.contains("too dangerous"));
+        let parsed: serde_json::Value = serde_json::from_str(json).expect("valid event json");
+        let content = parsed["content"]
+            .as_str()
+            .expect("event content should be a string");
+        assert!(content.contains(r#""interrupt":true"#));
+    }
+
+    #[test]
+    fn test_decode_permission_response_interrupt() {
+        let (response_type, message, cancel_turn) = decode_permission_response(
+            r#"{"decision":"deny","message":"stop here","interrupt":true}"#,
+        );
+
+        assert_eq!(
+            response_type,
+            crate::messages::PermissionResponseType::Denied
+        );
+        assert_eq!(message.as_deref(), Some("stop here"));
+        assert!(cancel_turn);
     }
 
     #[test]
@@ -1116,9 +1537,16 @@ mod tests {
         let event = build_session_state_event(
             "sess-state-test",
             "Fix the login bug",
+            Some("My Custom Title"),
             "/tmp/project",
             "working",
+            Some("needs_input"),
             "my-laptop",
+            "/home/testuser",
+            "claude",
+            "plan",
+            None,
+            None,
             &sk,
         )
         .unwrap();
@@ -1138,6 +1566,8 @@ mod tests {
         assert!(json.contains("working"));
         assert!(json.contains("/tmp/project"));
         assert!(json.contains(r#""hostname","my-laptop"#));
+        assert!(json.contains(r#""backend","claude"#));
+        assert!(json.contains(r#""permission-mode","plan"#));
     }
 
     #[test]
@@ -1154,5 +1584,156 @@ mod tests {
         assert!(!wrapped.contains("hello"));
         // Should be valid JSON
         assert!(serde_json::from_str::<serde_json::Value>(&wrapped).is_ok());
+    }
+
+    /// Verify that permission_request events participate in the seq counter,
+    /// producing correct ordering when interleaved with tool_call events.
+    #[test]
+    fn test_permission_request_seq_interleaves_with_tool_calls() {
+        let sk = test_secret_key();
+        let mut threading = ThreadingState::new();
+
+        // Build a tool_call event (simulating an assistant message with a tool use)
+        let tool_call_line = JsonlLine::parse(
+            r#"{"type":"assistant","uuid":"u1","sessionId":"seq-interleave","timestamp":"2026-02-09T20:00:01Z","cwd":"/tmp","version":"2.0.64","message":{"role":"assistant","model":"claude-opus-4-5-20251101","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}"#,
+        ).unwrap();
+        let tool_events = build_events(&tool_call_line, &mut threading, &sk).unwrap();
+        // tool_call event should have seq=0
+        assert!(
+            tool_events[0].note_json.contains(r#""seq","0"#),
+            "tool_call should have seq=0"
+        );
+        assert_eq!(threading.seq(), 1);
+
+        // Build a permission_request event (should get seq=1)
+        let perm_id = uuid::Uuid::new_v4();
+        let tool_input = serde_json::json!({"command": "rm -rf /tmp/test"});
+        let perm_event = build_permission_request_event(
+            &perm_id,
+            "Bash",
+            &tool_input,
+            "seq-interleave",
+            &mut threading,
+            &sk,
+        )
+        .unwrap();
+        assert!(
+            perm_event.note_json.contains(r#""seq","1"#),
+            "permission_request should have seq=1"
+        );
+        assert_eq!(threading.seq(), 2);
+
+        // Build a tool_result event (should get seq=2)
+        let tool_result_line = JsonlLine::parse(
+            r#"{"type":"user","uuid":"u2","parentUuid":"u1","sessionId":"seq-interleave","timestamp":"2026-02-09T20:00:01Z","cwd":"/tmp","version":"2.0.64","message":{"role":"user","content":[{"tool_use_id":"toolu_1","type":"tool_result","content":"file1.txt\nfile2.txt"}]}}"#,
+        ).unwrap();
+        let result_events = build_events(&tool_result_line, &mut threading, &sk).unwrap();
+        assert!(
+            result_events[0].note_json.contains(r#""seq","2"#),
+            "tool_result should have seq=2"
+        );
+        assert_eq!(threading.seq(), 3);
+    }
+
+    /// Verify that events with the same created_at but different seq tags
+    /// are sorted correctly, simulating the mobile sync scenario.
+    #[tokio::test]
+    async fn test_reconstruction_ordering_with_permission_requests() {
+        use nostrdb::{IngestMetadata, Ndb, Transaction};
+        use tempfile::TempDir;
+
+        let sk = test_secret_key();
+        let mut threading = ThreadingState::new();
+        let session_id = "ordering-test";
+
+        // Build events: user → tool_call → permission_request → tool_result
+        let user_line = JsonlLine::parse(
+            &format!(
+                r#"{{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"{}","timestamp":"2026-02-09T20:00:01Z","cwd":"/tmp","version":"2.0.64","message":{{"role":"user","content":"run a command"}}}}"#,
+                session_id
+            ),
+        ).unwrap();
+        let user_events = build_events(&user_line, &mut threading, &sk).unwrap();
+
+        let tool_call_line = JsonlLine::parse(
+            &format!(
+                r#"{{"type":"assistant","uuid":"u2","parentUuid":"u1","sessionId":"{}","timestamp":"2026-02-09T20:00:01Z","cwd":"/tmp","version":"2.0.64","message":{{"role":"assistant","model":"claude-opus-4-5-20251101","content":[{{"type":"tool_use","id":"toolu_1","name":"Bash","input":{{"command":"rm -rf /tmp/test"}}}}]}}}}"#,
+                session_id
+            ),
+        ).unwrap();
+        let tool_call_events = build_events(&tool_call_line, &mut threading, &sk).unwrap();
+
+        let perm_id = uuid::Uuid::new_v4();
+        let tool_input = serde_json::json!({"command": "rm -rf /tmp/test"});
+        let perm_event = build_permission_request_event(
+            &perm_id,
+            "Bash",
+            &tool_input,
+            session_id,
+            &mut threading,
+            &sk,
+        )
+        .unwrap();
+
+        // Collect all kind-1988 events
+        let mut all_events = Vec::new();
+        all_events.extend(
+            user_events
+                .iter()
+                .filter(|e| e.kind == AI_CONVERSATION_KIND),
+        );
+        all_events.push(&perm_event); // permission_request
+        all_events.extend(
+            tool_call_events
+                .iter()
+                .filter(|e| e.kind == AI_CONVERSATION_KIND),
+        );
+
+        // Ingest events into ndb in REVERSED order (simulating relay out-of-order delivery)
+        let tmp_dir = TempDir::new().unwrap();
+        let ndb = Ndb::new(tmp_dir.path().to_str().unwrap(), &test_config()).unwrap();
+
+        let filter = nostrdb::Filter::new()
+            .kinds([AI_CONVERSATION_KIND as u64])
+            .build();
+
+        // Ingest in reverse to simulate out-of-order relay delivery
+        for event in all_events.iter().rev() {
+            let sub_id = ndb.subscribe(std::slice::from_ref(&filter)).unwrap();
+            ndb.process_event_with(&event.to_event_json(), IngestMetadata::new().client(true))
+                .expect("ingest failed");
+            let _keys = ndb.wait_for_notes(sub_id, 1).await.unwrap();
+        }
+
+        // Query and sort the same way session_loader does: (created_at, seq)
+        let txn = Transaction::new(&ndb).unwrap();
+        let results = ndb.query(&txn, &[filter], 100).unwrap();
+        let mut notes: Vec<_> = results
+            .iter()
+            .filter_map(|qr| ndb.get_note_by_key(&txn, qr.note_key).ok())
+            .collect();
+
+        notes.sort_by_key(|note| {
+            let seq = get_tag_value(note, "seq")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(0);
+            (note.created_at(), seq)
+        });
+
+        // Extract roles in sorted order
+        let roles: Vec<_> = notes
+            .iter()
+            .filter_map(|n| get_tag_value(n, "role"))
+            .collect();
+
+        // Single-block assistant tool_use keeps role "assistant" (split only
+        // happens with multiple content blocks). The key invariant is that
+        // permission_request comes AFTER the assistant/tool_call event.
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "permission_request"],
+            "permission_request must come after assistant tool_call, got: {:?}",
+            roles
+        );
     }
 }

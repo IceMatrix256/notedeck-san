@@ -10,7 +10,7 @@ use egui::{
     widgets::text_edit::TextEdit,
     Frame, Layout, Margin, Pos2, ScrollArea, Sense, TextBuffer,
 };
-use enostr::{FilledKeypair, FullKeypair, NoteId, Pubkey, RelayPool};
+use enostr::{FilledKeypair, FullKeypair, NoteId, Pubkey};
 use nostrdb::{Ndb, Transaction};
 use notedeck::media::latest::LatestImageTex;
 use notedeck::media::AnimationMode;
@@ -18,14 +18,15 @@ use notedeck::media::AnimationMode;
 use notedeck::platform::android::try_open_file_picker;
 use notedeck::platform::get_next_selected_file;
 use notedeck::{
-    name::get_display_name, supported_mime_hosted_at_url, tr, Localization, NoteAction, NoteContext,
+    name::get_display_name, supported_mime_hosted_at_url, tr, Localization, NoteAction,
+    NoteContext, PublishApi, RelayType,
 };
 use notedeck::{DragResponse, PixelDimensions};
 use notedeck_ui::{
     app_images,
     context_menu::{input_context, PasteBehavior},
     note::render_note_preview,
-    NoteOptions, ProfilePic,
+    search_profiles, NoteOptions, ProfilePic,
 };
 use tracing::error;
 #[cfg(not(target_os = "android"))]
@@ -70,7 +71,7 @@ impl NewPostAction {
         &self,
         ndb: &Ndb,
         txn: &Transaction,
-        pool: &mut RelayPool,
+        publisher: &mut PublishApi<'_, '_>,
         drafts: &mut Drafts,
     ) -> Result<()> {
         let seckey = self.post.account.secret_key.to_secret_bytes();
@@ -96,7 +97,7 @@ impl NewPostAction {
             let _ = ndb.process_event_with(&json, nostrdb::IngestMetadata::new().client(true));
         }
 
-        pool.send(&event);
+        publisher.publish_note(&note, RelayType::AccountsWrite);
         drafts.get_from_post_type(&self.post_type).clear();
 
         Ok(())
@@ -270,7 +271,10 @@ impl<'a, 'd> PostView<'a, 'd> {
             return None;
         }
 
-        if ui.ctx().input(|r| r.key_pressed(egui::Key::Escape)) {
+        if ui
+            .ctx()
+            .input_mut(|r| r.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
             self.draft.buffer.delete_mention(mention.index);
             return None;
         }
@@ -278,19 +282,38 @@ impl<'a, 'd> PostView<'a, 'd> {
         let mention_str = self.draft.buffer.get_mention_string(&mention);
 
         if !mention_str.is_empty() {
-            if let Some(mention_hint) = &mut self.draft.cur_mention_hint {
-                if mention_hint.index != mention.index {
-                    mention_hint.index = mention.index;
-                    mention_hint.pos =
+            let text_changed;
+            if let Some(hint) = &mut self.draft.cur_mention_hint {
+                text_changed = hint.text != mention_str;
+                if hint.index != mention.index {
+                    hint.index = mention.index;
+                    hint.pos =
                         calculate_mention_hints_pos(textedit_output, mention.info.start_index);
                 }
-                mention_hint.text = mention_str.to_owned();
+                if text_changed {
+                    hint.text = mention_str.to_owned();
+                }
             } else {
+                text_changed = true;
                 self.draft.cur_mention_hint = Some(MentionHint {
                     index: mention.index,
                     text: mention_str.to_owned(),
                     pos: calculate_mention_hints_pos(textedit_output, mention.info.start_index),
+                    results: Vec::new(),
                 });
+            }
+
+            if text_changed {
+                let contacts = self
+                    .note_context
+                    .accounts
+                    .get_selected_account()
+                    .data
+                    .contacts
+                    .get_state();
+                let hint = self.draft.cur_mention_hint.as_mut().unwrap();
+                hint.results =
+                    search_profiles(self.note_context.ndb, txn, &hint.text, contacts, 128);
             }
         }
 
@@ -304,18 +327,15 @@ impl<'a, 'd> PostView<'a, 'd> {
             hint_rect
         };
 
-        let res = self
-            .note_context
-            .ndb
-            .search_profile(txn, mention_str, 10)
-            .ok()?;
+        let hint = self.draft.cur_mention_hint.as_ref().unwrap();
 
         let resp = MentionPickerView::new(
             self.note_context.img_cache,
             self.note_context.ndb,
             txn,
-            &res,
+            &hint.results,
             self.note_context.jobs,
+            self.note_context.i18n,
         )
         .show_in_rect(hint_rect, ui);
 
@@ -328,14 +348,15 @@ impl<'a, 'd> PostView<'a, 'd> {
         match out {
             ui::mentions_picker::MentionPickerResponse::SelectResult(selection) => {
                 if let Some(hint_index) = selection {
-                    if let Some(pk) = res.get(hint_index) {
-                        let record = self.note_context.ndb.get_profile_by_pubkey(txn, pk);
+                    let hint = self.draft.cur_mention_hint.as_ref().unwrap();
+                    if let Some(result) = hint.results.get(hint_index) {
+                        let record = self.note_context.ndb.get_profile_by_pubkey(txn, &result.pk);
 
                         if let Some(made_selection) =
                             self.draft.buffer.select_mention_and_replace_name(
                                 mention.index,
                                 get_display_name(record.ok().as_ref()).name(),
-                                Pubkey::new(**pk),
+                                Pubkey::new(result.pk),
                             )
                         {
                             selection_made = Some(made_selection);
@@ -417,7 +438,7 @@ impl<'a, 'd> PostView<'a, 'd> {
             .outer_margin(egui::Margin::same(PostView::outer_margin()))
             .fill(ui.visuals().window_fill)
             .stroke(stroke)
-            .corner_radius(12.0);
+            .corner_radius(notedeck::tokens::RADIUS_LG);
 
         if focused {
             frame = frame.shadow(egui::epaint::Shadow {
@@ -514,6 +535,7 @@ impl<'a, 'd> PostView<'a, 'd> {
             if post_button_clicked
                 || (!self.draft.buffer.is_empty() && shortcut_pressed && self.focused(ui))
             {
+                self.note_context.sound.play(notedeck::SoundEffect::Send);
                 let output = self.draft.buffer.output();
                 let new_post = NewPost::new(
                     output.text,
@@ -677,7 +699,11 @@ fn render_post_view_media(
             .to_points(ui.pixels_per_point())
             .to_vec();
 
-            let img_resp = ui.add(egui::Image::new(tex).max_size(size).corner_radius(12.0));
+            let img_resp = ui.add(
+                egui::Image::new(tex)
+                    .max_size(size)
+                    .corner_radius(notedeck::tokens::RADIUS_LG),
+            );
 
             let remove_button_rect = {
                 let top_left = img_resp.rect.left_top();
@@ -873,7 +899,7 @@ mod preview {
     }
 
     impl App for PostPreview {
-        fn update(&mut self, app: &mut AppContext<'_>, ui: &mut egui::Ui) -> AppResponse {
+        fn render(&mut self, app: &mut AppContext<'_>, ui: &mut egui::Ui) -> AppResponse {
             let txn = Transaction::new(app.ndb).expect("txn");
             let mut note_context = NoteContext {
                 ndb: app.ndb,
@@ -882,12 +908,12 @@ mod preview {
                 img_cache: app.img_cache,
                 note_cache: app.note_cache,
                 zaps: app.zaps,
-                pool: app.pool,
                 jobs: app.media_jobs.sender(),
                 unknown_ids: app.unknown_ids,
                 nip05_cache: app.nip05_cache,
                 clipboard: app.clipboard,
                 i18n: app.i18n,
+                sound: app.sound,
             };
 
             PostView::new(

@@ -1,5 +1,6 @@
 use egui::{CornerRadius, CursorIcon, Frame, Margin, Sense, Stroke};
 use egui_nav::{NavResponse, RouteResponse};
+use egui_winit::clipboard::Clipboard;
 use enostr::Pubkey;
 use nostrdb::Ndb;
 use notedeck::{
@@ -33,6 +34,7 @@ pub fn render_nav(
     img_cache: &mut Images,
     contacts: &ContactState,
     i18n: &mut Localization,
+    clipboard: &mut Clipboard,
 ) -> NavResponse<Option<MessagesAction>> {
     ui.painter().rect(
         ui.available_rect_before_wrap(),
@@ -87,6 +89,7 @@ pub fn render_nav(
                     img_cache,
                     contacts,
                     i18n,
+                    clipboard,
                 )
             }
         })
@@ -104,58 +107,71 @@ fn render_nav_body(
     img_cache: &mut Images,
     contacts: &ContactState,
     i18n: &mut Localization,
+    clipboard: &mut Clipboard,
 ) -> RouteResponse<Option<MessagesAction>> {
-    let response = match top {
-        Route::ConvoList => {
-            let mut frame = Frame::new();
-            if !is_narrow(ui.ctx()) {
-                frame = frame.inner_margin(Margin {
-                    left: 12,
-                    right: 12,
-                    top: 0,
-                    bottom: 10,
-                });
-            }
-            frame
-                .show(ui, |ui| {
-                    ConversationListUi::new(cache, states, jobs, ndb, img_cache, i18n)
-                        .ui(ui, selected_pubkey)
-                })
-                .inner
-        }
-        Route::CreateConvo => 's: {
-            // Escape key goes back
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                break 's Some(MessagesAction::Back);
-            }
+    // Route-specific IDs keep egui_nav transitions from reusing the same
+    // auto-generated widget IDs across background/foreground layers.
+    let response = ui
+        .push_id(
+            match top {
+                Route::ConvoList => "convo_list",
+                Route::CreateConvo => "create_convo",
+                Route::Conversation => "conversation",
+            },
+            |ui| match top {
+                Route::ConvoList => {
+                    let mut frame = Frame::new();
+                    if !is_narrow(ui.ctx()) {
+                        frame = frame.inner_margin(Margin {
+                            left: 12,
+                            right: 12,
+                            top: 0,
+                            bottom: 10,
+                        });
+                    }
+                    frame
+                        .show(ui, |ui| {
+                            ConversationListUi::new(cache, states, jobs, ndb, img_cache, i18n)
+                                .ui(ui, selected_pubkey)
+                        })
+                        .inner
+                }
+                Route::CreateConvo => 's: {
+                    // Escape key goes back
+                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                        break 's Some(MessagesAction::Back);
+                    }
 
-            let Some(r) = CreateConvoUi::new(
-                ndb,
-                jobs,
-                img_cache,
-                contacts,
-                i18n,
-                &mut states.create_convo,
-            )
-            .ui(ui) else {
-                break 's None;
-            };
+                    let Some(r) = CreateConvoUi::new(
+                        ndb,
+                        jobs,
+                        img_cache,
+                        contacts,
+                        i18n,
+                        &mut states.create_convo,
+                    )
+                    .ui(ui) else {
+                        break 's None;
+                    };
 
-            Some(MessagesAction::Create {
-                recipient: r.recipient,
-            })
-        }
-        Route::Conversation => conversation_ui(
-            cache,
-            states,
-            jobs,
-            ndb,
-            ui,
-            img_cache,
-            i18n,
-            selected_pubkey,
-        ),
-    };
+                    Some(MessagesAction::Create {
+                        recipient: r.recipient,
+                    })
+                }
+                Route::Conversation => conversation_ui(
+                    cache,
+                    states,
+                    jobs,
+                    ndb,
+                    ui,
+                    img_cache,
+                    i18n,
+                    selected_pubkey,
+                    clipboard,
+                ),
+            },
+        )
+        .inner;
 
     RouteResponse {
         response,
@@ -203,6 +219,7 @@ impl<'a> NavTitle<'a> {
 
         let mut right_action = None;
         let mut left_action = None;
+        let mut title_action = None;
 
         HorizontalHeader::new(48.0)
             .with_margin(Margin::symmetric(12, 8))
@@ -227,17 +244,20 @@ impl<'a> NavTitle<'a> {
                     }
                 },
                 |ui| {
-                    self.title(ui, top);
+                    title_action = self.title(ui, top);
                 },
                 |ui: &mut egui::Ui| match top {
                     Route::ConvoList => {
-                        let new_msg_icon = app_images::new_message_image().max_height(24.0);
-                        if ui
-                            .add(new_msg_icon)
-                            .on_hover_cursor(CursorIcon::PointingHand)
-                            .interact(egui::Sense::click())
-                            .clicked()
-                        {
+                        let new_msg_icon = app_images::new_message_image()
+                            .max_height(24.0)
+                            .alt_text("New Chat");
+                        let response = ui
+                            .add(egui::ImageButton::new(new_msg_icon).frame(false))
+                            .on_hover_cursor(CursorIcon::PointingHand);
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New Chat")
+                        });
+                        if response.clicked() {
                             tracing::info!("CLICKED NEW MSG");
                             right_action = Some(MessagesAction::Creating);
                         }
@@ -247,10 +267,10 @@ impl<'a> NavTitle<'a> {
                 },
             );
 
-        right_action.or(left_action)
+        right_action.or(left_action).or(title_action)
     }
 
-    fn title(&mut self, ui: &mut egui::Ui, route: &Route) {
+    fn title(&mut self, ui: &mut egui::Ui, route: &Route) -> Option<MessagesAction> {
         match route {
             Route::ConvoList => {
                 let label = tr!(
@@ -259,6 +279,7 @@ impl<'a> NavTitle<'a> {
                     "Title for the list of chat conversations"
                 );
                 title_label(ui, &label);
+                None
             }
             Route::CreateConvo => {
                 let label = tr!(
@@ -267,12 +288,13 @@ impl<'a> NavTitle<'a> {
                     "Title shown when composing a new conversation"
                 );
                 title_label(ui, &label);
+                None
             }
             Route::Conversation => self.conversation_title_section(ui),
         }
     }
 
-    fn conversation_title_section(&mut self, ui: &mut egui::Ui) {
+    fn conversation_title_section(&mut self, ui: &mut egui::Ui) -> Option<MessagesAction> {
         conversation_header_impl(
             ui,
             self.i18n,
@@ -281,13 +303,18 @@ impl<'a> NavTitle<'a> {
             self.ndb,
             self.jobs,
             self.img_cache,
-        );
+        )
     }
 }
 
 fn back_button(ui: &mut egui::Ui, chev_size: egui::Vec2) -> egui::Response {
     let color = ui.style().visuals.noninteractive().fg_stroke.color;
-    chevron(ui, 2.0, chev_size, egui::Stroke::new(2.0, color))
+    chevron(
+        ui,
+        notedeck::tokens::STROKE_THICK,
+        chev_size,
+        egui::Stroke::new(notedeck::tokens::STROKE_THICK, color),
+    )
 }
 
 fn prev<R>(xs: &[R]) -> Option<&R> {

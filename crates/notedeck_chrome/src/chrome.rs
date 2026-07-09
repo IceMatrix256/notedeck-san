@@ -39,17 +39,23 @@ use notedeck_ui::expanding_button;
 use notedeck_ui::{app_images, galley_centered_pos, ProfilePic};
 use std::collections::HashMap;
 
-#[derive(Default)]
 pub struct Chrome {
     active: i32,
     options: ChromeOptions,
     apps: Vec<NotedeckApp>,
+
+    /// Track which apps have been opened (activated) at least once.
+    /// Only opened apps receive `update()` calls each frame.
+    opened: Vec<bool>,
 
     /// The state of the soft keyboard animation
     soft_kb_anim_state: AnimState,
 
     pub repaint_causes: HashMap<egui::RepaintCause, u64>,
     nav: DrawerRouter,
+
+    #[cfg(feature = "auto-update")]
+    updater: notedeck::updater::Updater,
 }
 
 #[derive(Clone)]
@@ -65,6 +71,10 @@ pub enum ChromePanelAction {
     Wallet,
     SaveTheme(ThemePreference),
     Profile(notedeck::enostr::Pubkey),
+    #[cfg(feature = "auto-update")]
+    ApplyUpdate,
+    #[cfg(feature = "auto-update")]
+    DismissUpdate,
 }
 
 bitflags! {
@@ -124,6 +134,18 @@ impl ChromePanelAction {
             Self::Profile(pk) => {
                 columns_route_to_profile(pk, chrome, ctx, ui);
             }
+
+            #[cfg(feature = "auto-update")]
+            Self::ApplyUpdate => {
+                if let Err(e) = chrome.updater.apply_and_restart() {
+                    tracing::error!("failed to apply update: {e}");
+                }
+            }
+
+            #[cfg(feature = "auto-update")]
+            Self::DismissUpdate => {
+                chrome.updater.dismiss();
+            }
         }
     }
 }
@@ -154,17 +176,43 @@ impl Chrome {
     ) -> Result<Self, Error> {
         stop_debug_mode(notedeck.options());
 
-        let context = &mut notedeck.app_context();
+        let app_ref = &mut notedeck.notedeck_ref(&cc.egui_ctx);
         let dave = Dave::new(
             cc.wgpu_render_state.as_ref(),
-            context.ndb.clone(),
+            app_ref.app_ctx.ndb.clone(),
             cc.egui_ctx.clone(),
+            app_ref.app_ctx.path,
         );
-        let mut chrome = Chrome::default();
+        #[cfg(feature = "wasm")]
+        let wasm_dir = app_ref
+            .app_ctx
+            .path
+            .path(notedeck::DataPathType::Cache)
+            .join("wasm_apps");
+
+        let mut chrome = Chrome {
+            active: 0,
+            options: ChromeOptions::default(),
+            apps: Vec::new(),
+            opened: Vec::new(),
+            soft_kb_anim_state: AnimState::default(),
+            repaint_causes: HashMap::new(),
+            nav: DrawerRouter::default(),
+            #[cfg(feature = "auto-update")]
+            updater: notedeck::updater::Updater::new(
+                app_ref.app_ctx.path,
+                &app_ref.app_ctx.ndb,
+                &cc.egui_ctx,
+                notedeck::updater::nostr::DEFAULT_RELEASE_PUBKEY,
+                notedeck::updater::nostr::ReleaseChannel::from_setting(
+                    app_ref.app_ctx.settings.release_channel(),
+                ),
+            ),
+        };
 
         if !app_args.iter().any(|arg| arg == "--no-columns-app") {
-            let columns = Damus::new(context, app_args);
-            notedeck.check_args(columns.unrecognized_args())?;
+            let columns = Damus::new(&mut app_ref.app_ctx, app_args);
+            app_ref.internals.check_args(columns.unrecognized_args())?;
             chrome.add_app(NotedeckApp::Columns(Box::new(columns)));
         }
 
@@ -182,9 +230,92 @@ impl Chrome {
         #[cfg(feature = "clndash")]
         chrome.add_app(NotedeckApp::ClnDash(Box::default()));
 
+        #[cfg(feature = "nostrverse")]
+        chrome.add_app(NotedeckApp::Nostrverse(Box::new(
+            notedeck_nostrverse::NostrverseApp::demo(cc.wgpu_render_state.as_ref()),
+        )));
+
+        #[cfg(feature = "wasm")]
+        {
+            tracing::info!("looking for WASM apps in: {}", wasm_dir.display());
+            if wasm_dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&wasm_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().is_some_and(|e| e == "wasm") {
+                            match notedeck_wasm::WasmApp::from_file(&path) {
+                                Ok(app) => {
+                                    let name = app.name().to_string();
+                                    tracing::info!(
+                                        "loaded WASM app '{}': {}",
+                                        name,
+                                        path.display()
+                                    );
+                                    chrome.add_app(NotedeckApp::Other(name, Box::new(app)));
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "failed to load WASM app {}: {e}",
+                                        path.display()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                tracing::info!("WASM apps directory not found: {}", wasm_dir.display());
+            }
+        }
+
         chrome.set_active(0);
 
+        app_ref.app_ctx.sound.play(notedeck::SoundEffect::Startup);
+
         Ok(chrome)
+    }
+
+    /// Create a Chrome for snapshot tests — no eframe CreationContext needed.
+    #[cfg(feature = "auto-update")]
+    pub fn new_test(
+        ctx: &mut notedeck::AppContext,
+        egui_ctx: &egui::Context,
+        args: &[String],
+    ) -> Self {
+        let damus = Damus::new(ctx, args);
+        let mut chrome = Chrome {
+            active: 0,
+            options: ChromeOptions::default(),
+            apps: Vec::new(),
+            opened: Vec::new(),
+            soft_kb_anim_state: AnimState::default(),
+            repaint_causes: HashMap::new(),
+            nav: DrawerRouter::default(),
+            updater: notedeck::updater::Updater::new(
+                ctx.path,
+                &ctx.ndb,
+                egui_ctx,
+                notedeck::updater::nostr::DEFAULT_RELEASE_PUBKEY,
+                notedeck::updater::nostr::ReleaseChannel::from_setting(
+                    ctx.settings.release_channel(),
+                ),
+            ),
+        };
+        chrome.add_app(NotedeckApp::Columns(Box::new(damus)));
+        chrome.set_active(0);
+        chrome
+    }
+
+    /// Override the release signing pubkey and resubscribe to ndb.
+    #[cfg(all(feature = "auto-update", feature = "snapshot-testing"))]
+    pub fn set_release_pubkey(&mut self, ndb: &mut nostrdb::Ndb, pubkey: [u8; 32]) {
+        self.updater.set_release_pubkey(ndb, pubkey);
+    }
+
+    /// Force the updater into ReadyToInstall state (for snapshot tests).
+    #[cfg(all(feature = "auto-update", feature = "snapshot-testing"))]
+    pub fn force_update_ready(&mut self, version: String) {
+        self.updater.force_ready(version);
     }
 
     pub fn toggle(&mut self) {
@@ -195,8 +326,24 @@ impl Chrome {
         }
     }
 
+    /// Chrome-level keybindings — consumed before apps render,
+    /// so apps can never intercept them.
+    fn handle_chrome_keybindings(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F11)) {
+            self.toggle();
+        }
+    }
+
+    /// Fallback keybindings — only fire if no app consumed the key.
+    fn handle_fallback_keybindings(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.toggle();
+        }
+    }
+
     pub fn add_app(&mut self, app: NotedeckApp) {
         self.apps.push(app);
+        self.opened.push(false);
     }
 
     fn get_columns_app(&mut self) -> Option<&mut Damus> {
@@ -213,6 +360,9 @@ impl Chrome {
         for (i, app) in self.apps.iter().enumerate() {
             if let NotedeckApp::Columns(_) = app {
                 self.active = i as i32;
+                if let Some(opened) = self.opened.get_mut(i) {
+                    *opened = true;
+                }
             }
         }
     }
@@ -230,12 +380,74 @@ impl Chrome {
         for (i, app) in self.apps.iter().enumerate() {
             if let NotedeckApp::Dave(_) = app {
                 self.active = i as i32;
+                if let Some(opened) = self.opened.get_mut(i) {
+                    *opened = true;
+                }
             }
+        }
+    }
+
+    #[cfg(feature = "messages")]
+    fn switch_to_messages(&mut self) {
+        for (i, app) in self.apps.iter().enumerate() {
+            if let NotedeckApp::Messages(_) = app {
+                self.active = i as i32;
+                if let Some(opened) = self.opened.get_mut(i) {
+                    *opened = true;
+                }
+            }
+        }
+    }
+
+    fn process_toolbar_action(&mut self, action: ChromeToolbarAction, ctx: &mut AppContext) {
+        match action {
+            ChromeToolbarAction::Home => {
+                self.switch_to_columns();
+                if let Some(columns) = self.get_columns_app() {
+                    columns.navigate_home(ctx);
+                }
+            }
+            #[cfg(feature = "messages")]
+            ChromeToolbarAction::Chat => {
+                self.switch_to_messages();
+            }
+            ChromeToolbarAction::Search => {
+                self.switch_to_columns();
+                if let Some(columns) = self.get_columns_app() {
+                    columns.navigate_search(ctx);
+                }
+            }
+            ChromeToolbarAction::Notifications => {
+                self.switch_to_columns();
+                if let Some(columns) = self.get_columns_app() {
+                    columns.navigate_notifications(ctx);
+                }
+            }
+        }
+    }
+
+    /// Returns which ChromeToolbarAction is currently "active" based on
+    /// the active app and its route. Used to highlight the current tab.
+    fn active_toolbar_tab(&self, accounts: &notedeck::Accounts) -> Option<ChromeToolbarAction> {
+        let active_app = &self.apps[self.active as usize];
+        match active_app {
+            #[cfg(feature = "messages")]
+            NotedeckApp::Messages(_) => Some(ChromeToolbarAction::Chat),
+            NotedeckApp::Columns(columns) => match columns.active_toolbar_tab(accounts) {
+                Some(0) => Some(ChromeToolbarAction::Home),
+                Some(1) => Some(ChromeToolbarAction::Search),
+                Some(2) => Some(ChromeToolbarAction::Notifications),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
     pub fn set_active(&mut self, app: i32) {
         self.active = app;
+        if let Some(opened) = self.opened.get_mut(app as usize) {
+            *opened = true;
+        }
     }
 
     /// The chrome side panel
@@ -265,7 +477,7 @@ impl Chrome {
                     },
                 );
                 egui::Frame::new()
-                    .inner_margin(Margin::same(16))
+                    .inner_margin(Margin::same(notedeck::tokens::SPACING_LG as i8))
                     .show(ui, |ui| {
                         let options = if amt_keyboard_open > 0.0 {
                             SidebarOptions::Compact
@@ -291,7 +503,7 @@ impl Chrome {
                     .inner
             }
             ChromeRoute::App => {
-                let resp = self.apps[self.active as usize].update(app_ctx, ui);
+                let resp = self.apps[self.active as usize].render(app_ctx, ui);
 
                 if let Some(action) = resp.action {
                     chrome_handle_app_action(self, app_ctx, action, ui);
@@ -336,19 +548,47 @@ impl Chrome {
             0.0
         };
 
+        let is_narrow = notedeck::ui::is_narrow(ui.ctx());
+        let toolbar_height = if is_narrow && ctx.settings.welcome_completed() {
+            toolbar_visibility_height(skb_anim.skb_rect, ui)
+        } else {
+            0.0
+        };
+
+        let (unseen_notifications, active_toolbar_tab) = if is_narrow {
+            let unseen = self
+                .get_columns_app()
+                .map(|c| c.has_unseen_notifications(ctx.accounts))
+                .unwrap_or(false);
+            let active = self.active_toolbar_tab(ctx.accounts);
+            (unseen, active)
+        } else {
+            (false, None)
+        };
+
         // if the soft keyboard is open, shrink the chrome contents
         let mut action: Option<ChromePanelAction> = None;
+        let mut toolbar_action: Option<ChromeToolbarAction> = None;
         // build a strip to carve out the soft keyboard inset
         let prev_spacing = ui.spacing().item_spacing;
         ui.spacing_mut().item_spacing.y = 0.0;
         StripBuilder::new(ui)
             .size(Size::remainder())
+            .size(Size::exact(toolbar_height))
             .size(Size::exact(keyboard_height))
             .vertical(|mut strip| {
                 // the actual content, shifted up because of the soft keyboard
                 strip.cell(|ui| {
                     ui.spacing_mut().item_spacing = prev_spacing;
                     action = self.panel(ctx, ui, keyboard_height);
+                });
+
+                // mobile toolbar
+                strip.cell(|ui| {
+                    if toolbar_height > 0.0 {
+                        toolbar_action =
+                            chrome_toolbar(ui, unseen_notifications, active_toolbar_tab);
+                    }
                 });
 
                 // the filler space taken up by the soft keyboard
@@ -374,24 +614,284 @@ impl Chrome {
             }
         }
 
+        if let Some(tb_action) = toolbar_action {
+            self.process_toolbar_action(tb_action, ctx);
+        }
+
         action
     }
 }
 
+#[cfg(feature = "auto-update")]
+fn poll_updater(updater: &mut notedeck::updater::Updater, ctx: &mut notedeck::AppContext) {
+    // Sync release channel from settings (cheap string compare, only parses on change)
+    let setting_str = ctx.settings.release_channel();
+    if setting_str != updater.channel().as_str() {
+        if let Some(ch) = notedeck::updater::nostr::ReleaseChannel::parse(setting_str) {
+            updater.set_channel(ch);
+        }
+    }
+
+    if updater.needs_relay_sub() {
+        tracing::debug!("updater: sending release filter to relays");
+        let release_pubkey = *updater.release_pubkey();
+        let filters = notedeck::updater::nostr::release_filter(&release_pubkey);
+        let mut oneshot = ctx.remote.oneshot(ctx.accounts);
+        oneshot.oneshot(filters);
+    }
+
+    if updater.wants_release() {
+        let release_sub = updater.release_sub();
+        let nks = ctx.ndb.poll_for_notes(release_sub, 10);
+        if !nks.is_empty() {
+            tracing::debug!(
+                "updater: got {} new note(s) from release subscription",
+                nks.len()
+            );
+            updater.note_received();
+        }
+    }
+    updater.check_gathering(ctx.ndb);
+    updater.poll(ctx.ndb);
+}
+
+#[cfg(feature = "auto-update")]
+fn update_sidebar_item_ui(
+    updater: &notedeck::updater::Updater,
+    ui: &mut egui::Ui,
+) -> Option<ChromePanelAction> {
+    let version = updater.update_ready()?;
+
+    let accent = notedeck_ui::colors::PINK;
+    let desired_size = egui::vec2(ui.available_width(), 40.0);
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+
+    if ui.is_rect_visible(rect) {
+        let rounding = 8.0;
+        let bg = if response.hovered() {
+            accent.gamma_multiply(0.9)
+        } else {
+            accent
+        };
+        ui.painter().rect_filled(rect, rounding, bg);
+
+        // Draw update arrow icon on the left
+        let icon_size = 16.0;
+        let icon_center = egui::pos2(rect.left() + 20.0, rect.center().y);
+        notedeck_ui::icons::draw_update_icon(
+            ui.painter(),
+            icon_center,
+            icon_size,
+            Color32::WHITE,
+            2.0,
+        );
+
+        // "Update available" text
+        let text_pos = egui::pos2(rect.left() + 38.0, rect.center().y);
+        let font = egui::FontId::new(
+            notedeck::fonts::get_font_size(ui.ctx(), &NotedeckTextStyle::Body),
+            egui::FontFamily::Name(notedeck::fonts::NamedFontFamily::Bold.as_str().into()),
+        );
+        let galley =
+            ui.painter()
+                .layout_no_wrap(format!("Update to {version}"), font, Color32::WHITE);
+        let text_y = text_pos.y - galley.size().y / 2.0;
+        ui.painter()
+            .galley(egui::pos2(text_pos.x, text_y), galley, Color32::WHITE);
+    }
+
+    if response.clicked() {
+        Some(ChromePanelAction::ApplyUpdate)
+    } else {
+        None
+    }
+}
+
 impl notedeck::App for Chrome {
-    fn update(&mut self, ctx: &mut notedeck::AppContext, ui: &mut egui::Ui) -> AppResponse {
+    fn update(&mut self, ctx: &mut notedeck::AppContext, _egui_ctx: &egui::Context) {
+        ctx.sound.update();
+
+        #[cfg(feature = "auto-update")]
+        poll_updater(&mut self.updater, ctx);
+
+        // Update opened apps every frame so background processing
+        // (relay pools, subscriptions, etc.) stays alive.
+        // Apps that haven't been opened yet are skipped.
+        for (i, app) in self.apps.iter_mut().enumerate() {
+            if self.opened.get(i).copied().unwrap_or(false) {
+                app.update(ctx, _egui_ctx);
+            }
+        }
+    }
+
+    fn render(&mut self, ctx: &mut notedeck::AppContext, ui: &mut egui::Ui) -> AppResponse {
         #[cfg(feature = "tracy")]
         {
             ui.ctx().request_repaint();
         }
 
+        // Chrome-level keybindings — consumed before apps render,
+        // so apps can never intercept them.
+        self.handle_chrome_keybindings(ui.ctx());
+
         if let Some(action) = self.show(ctx, ui) {
             action.process(ctx, self, ui);
             self.nav.close();
         }
+
+        // Fallback keybindings — only fire if no app consumed the key.
+        self.handle_fallback_keybindings(ui.ctx());
+
         // TODO: unify this constant with the columns side panel width. ui crate?
         AppResponse::none()
     }
+}
+
+const TOOLBAR_HEIGHT: f32 = 48.0;
+
+#[derive(Debug, Eq, PartialEq)]
+enum ChromeToolbarAction {
+    Home,
+    #[cfg(feature = "messages")]
+    Chat,
+    Search,
+    Notifications,
+}
+
+/// Compute the animated toolbar height, auto-hiding on scroll and
+/// when the soft keyboard is open.
+fn toolbar_visibility_height(skb_rect: Option<Rect>, ui: &mut Ui) -> f32 {
+    let toolbar_visible_id = egui::Id::new("chrome_toolbar_visible");
+
+    let scroll_delta = scroll_delta(ui.ctx());
+    let velocity_threshold = 1.0;
+
+    if scroll_delta > velocity_threshold {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(toolbar_visible_id, true));
+    } else if scroll_delta < -velocity_threshold {
+        ui.ctx()
+            .data_mut(|d| d.insert_temp(toolbar_visible_id, false));
+    }
+
+    let toolbar_visible = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(toolbar_visible_id))
+        .unwrap_or(true);
+
+    let toolbar_anim = ui
+        .ctx()
+        .animate_bool_responsive(toolbar_visible_id.with("anim"), toolbar_visible);
+
+    if skb_rect.is_none() {
+        TOOLBAR_HEIGHT * toolbar_anim
+    } else {
+        0.0
+    }
+}
+
+/// Detect vertical scroll intent from mouse wheel, trackpad, or touch drag.
+fn scroll_delta(ctx: &egui::Context) -> f32 {
+    ctx.input(|i| {
+        let sd = i.smooth_scroll_delta.y;
+        if sd.abs() > 0.5 {
+            return sd;
+        }
+        if i.pointer.is_decidedly_dragging() {
+            return i.pointer.velocity().y;
+        }
+        0.0
+    })
+}
+
+/// Render the Chrome mobile toolbar (Home, Chat, Search, Notifications).
+fn chrome_toolbar(
+    ui: &mut Ui,
+    unseen_notifications: bool,
+    active_tab: Option<ChromeToolbarAction>,
+) -> Option<ChromeToolbarAction> {
+    use egui_tabs::{TabColor, Tabs};
+    use notedeck_ui::icons::{home_button, notifications_button, search_button};
+
+    let rect = ui.available_rect_before_wrap();
+    let bg = if ui.visuals().dark_mode {
+        Color32::BLACK
+    } else {
+        notedeck_ui::colors::ALMOST_WHITE
+    };
+    ui.painter().rect_filled(rect, 0.0, bg);
+    ui.painter().hline(
+        rect.x_range(),
+        rect.top(),
+        ui.visuals().widgets.noninteractive.bg_stroke,
+    );
+
+    let has_chat = cfg!(feature = "messages");
+    let mut next_index = 0;
+    let home_index = next_index;
+    next_index += 1;
+    let chat_index = if has_chat {
+        let i = next_index;
+        next_index += 1;
+        Some(i)
+    } else {
+        None
+    };
+    let search_index = next_index;
+    next_index += 1;
+    let notif_index = next_index;
+    let tab_count = notif_index + 1;
+
+    let rs = Tabs::new(tab_count)
+        .selected(0)
+        .hover_bg(TabColor::none())
+        .selected_fg(TabColor::none())
+        .selected_bg(TabColor::none())
+        .height(TOOLBAR_HEIGHT)
+        .layout(Layout::centered_and_justified(egui::Direction::TopDown))
+        .show(ui, |ui, state| {
+            let index = state.index();
+            let btn_size: f32 = 20.0;
+
+            if index == home_index {
+                let active = active_tab == Some(ChromeToolbarAction::Home);
+                if home_button(ui, btn_size, active).clicked() {
+                    return Some(ChromeToolbarAction::Home);
+                }
+            } else if Some(index) == chat_index {
+                #[cfg(feature = "messages")]
+                {
+                    let active = active_tab == Some(ChromeToolbarAction::Chat);
+                    if notedeck_ui::icons::chat_button(ui, btn_size, active).clicked() {
+                        return Some(ChromeToolbarAction::Chat);
+                    }
+                }
+            } else if index == search_index {
+                let active = active_tab == Some(ChromeToolbarAction::Search);
+                if ui
+                    .add(search_button(ui.visuals().text_color(), 2.0, active))
+                    .clicked()
+                {
+                    return Some(ChromeToolbarAction::Search);
+                }
+            } else if index == notif_index {
+                let active = active_tab == Some(ChromeToolbarAction::Notifications);
+                if notifications_button(ui, btn_size, active, unseen_notifications).clicked() {
+                    return Some(ChromeToolbarAction::Notifications);
+                }
+            }
+
+            None
+        })
+        .inner();
+
+    for maybe_r in rs {
+        if maybe_r.inner.is_some() {
+            return maybe_r.inner;
+        }
+    }
+
+    None
 }
 
 fn milestone_name<'a>(i18n: &'a mut Localization) -> impl Widget + 'a {
@@ -526,7 +1026,7 @@ fn chrome_handle_app_action(
                 &mut columns.timeline_cache,
                 &mut columns.threads,
                 ctx.note_cache,
-                ctx.pool,
+                &mut ctx.remote,
                 &txn,
                 ctx.unknown_ids,
                 ctx.accounts,
@@ -541,7 +1041,7 @@ fn chrome_handle_app_action(
             if let Some(action) = m_action {
                 let col = cols.selected_mut();
 
-                action.process_router_action(&mut col.router, &mut col.sheet_router);
+                action.process_router_action(&mut col.router, &mut col.sheet_router, ctx.sound);
             }
         }
     }
@@ -583,7 +1083,7 @@ fn columns_route_to_profile(
         &mut columns.timeline_cache,
         &mut columns.threads,
         ctx.note_cache,
-        ctx.pool,
+        &mut ctx.remote,
         &txn,
         ctx.unknown_ids,
         ctx.accounts,
@@ -598,7 +1098,7 @@ fn columns_route_to_profile(
     if let Some(action) = m_action {
         let col = cols.selected_mut();
 
-        action.process_router_action(&mut col.router, &mut col.sheet_router);
+        action.process_router_action(&mut col.router, &mut col.sheet_router, ctx.sound);
     }
 }
 
@@ -670,6 +1170,11 @@ fn topdown_sidebar(
     }
 
     let mut action = None;
+
+    #[cfg(feature = "auto-update")]
+    if let Some(update_action) = update_sidebar_item_ui(&chrome.updater, ui) {
+        action = Some(update_action);
+    }
 
     let theme = ui.ctx().theme();
 
@@ -839,7 +1344,15 @@ fn topdown_sidebar(
 
             #[cfg(feature = "clndash")]
             NotedeckApp::ClnDash(_) => tr!(loc, "ClnDash", "Button to go to the ClnDash app"),
-            NotedeckApp::Other(_) => tr!(loc, "Other", "Button to go to the Other app"),
+
+            #[cfg(feature = "nostrverse")]
+            NotedeckApp::Nostrverse(_) => {
+                tr!(loc, "Nostrverse", "Button to go to the Nostrverse app")
+            }
+
+            NotedeckApp::Other(name, _) => {
+                tr!(loc, name.as_str(), "Button to go to a WASM app")
+            }
         };
 
         StripBuilder::new(ui)
@@ -849,47 +1362,49 @@ fn topdown_sidebar(
                 strip.strip(|b| {
                     let resp = drawer_item(
                         b,
-                        |ui| {
-                            match app {
-                                NotedeckApp::Columns(_columns_app) => {
-                                    ui.add(app_images::columns_image());
-                                }
+                        |ui| match app {
+                            NotedeckApp::Columns(_columns_app) => {
+                                ui.add(app_images::columns_image());
+                            }
 
-                                NotedeckApp::Dave(dave) => {
-                                    dave_button(
-                                        dave.avatar_mut(),
-                                        ui,
-                                        Rect::from_center_size(
-                                            ui.available_rect_before_wrap().center(),
-                                            vec2(30.0, 30.0),
-                                        ),
-                                    );
-                                }
+                            NotedeckApp::Dave(dave) => {
+                                dave_button(
+                                    dave.avatar_mut(),
+                                    ui,
+                                    Rect::from_center_size(
+                                        ui.available_rect_before_wrap().center(),
+                                        vec2(30.0, 30.0),
+                                    ),
+                                );
+                            }
 
-                                #[cfg(feature = "dashboard")]
-                                NotedeckApp::Dashboard(_columns_app) => {
-                                    ui.add(app_images::algo_image());
-                                }
+                            #[cfg(feature = "dashboard")]
+                            NotedeckApp::Dashboard(_columns_app) => {
+                                ui.add(app_images::algo_image());
+                            }
 
-                                #[cfg(feature = "messages")]
-                                NotedeckApp::Messages(_dms) => {
-                                    ui.add(app_images::new_message_image());
-                                }
+                            #[cfg(feature = "messages")]
+                            NotedeckApp::Messages(_dms) => {
+                                ui.add(app_images::new_message_image());
+                            }
 
-                                #[cfg(feature = "clndash")]
-                                NotedeckApp::ClnDash(_clndash) => {
-                                    clndash_button(ui);
-                                }
+                            #[cfg(feature = "clndash")]
+                            NotedeckApp::ClnDash(_clndash) => {
+                                clndash_button(ui);
+                            }
 
-                                #[cfg(feature = "notebook")]
-                                NotedeckApp::Notebook(_notebook) => {
-                                    notebook_button(ui);
-                                }
+                            #[cfg(feature = "notebook")]
+                            NotedeckApp::Notebook(_notebook) => {
+                                notebook_button(ui);
+                            }
 
-                                NotedeckApp::Other(_other) => {
-                                    // app provides its own button rendering ui?
-                                    panic!("TODO: implement other apps")
-                                }
+                            #[cfg(feature = "nostrverse")]
+                            NotedeckApp::Nostrverse(_nostrverse) => {
+                                ui.add(app_images::universe_image());
+                            }
+
+                            NotedeckApp::Other(_name, _other) => {
+                                ui.label("W");
                             }
                         },
                         text,
@@ -898,6 +1413,9 @@ fn topdown_sidebar(
 
                     if resp.clicked() {
                         chrome.active = i as i32;
+                        if let Some(opened) = chrome.opened.get_mut(i) {
+                            *opened = true;
+                        }
                         chrome.nav.close();
                     }
                 })

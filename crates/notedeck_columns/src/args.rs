@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use crate::nfilter::filter_from_querystring;
+use crate::timeline::kind::FilterVec;
 use crate::timeline::TimelineKind;
 use enostr::{Filter, Pubkey};
 use oot_bitset::{bitset_clear, bitset_get, bitset_set};
@@ -64,6 +66,8 @@ impl ColumnsArgs {
                 };
 
                 if let Ok(filter) = Filter::from_json(filter) {
+                    res.columns.push(ArgColumn::Generic(vec![filter]));
+                } else if let Some(filter) = filter_from_querystring(filter) {
                     res.columns.push(ArgColumn::Generic(vec![filter]));
                 } else {
                     error!("failed to parse filter '{}'", filter);
@@ -206,10 +210,7 @@ pub enum ArgColumn {
 impl ArgColumn {
     pub fn into_timeline_kind(self) -> TimelineKind {
         match self {
-            ArgColumn::Generic(_filters) => {
-                // TODO: fix generic filters by referencing some filter map
-                TimelineKind::Generic(0)
-            }
+            ArgColumn::Generic(filters) => TimelineKind::Generic(FilterVec::from_filters(&filters)),
             ArgColumn::Timeline(tk) => tk,
         }
     }

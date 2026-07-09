@@ -8,9 +8,43 @@ on:
   pull_request:
     branches:
       - "*"
+  release:
+    types: [published]
 
 jobs:
-  lint: 
+  changelog-check:
+    name: Changelog Trailers
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check commits for Changelog trailers
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          fail=0
+          for sha in $(git rev-list "$base".."$head"); do
+            msg=$(git log -1 --format="%B" "$sha")
+            # Skip merge commits
+            if echo "$msg" | head -1 | grep -qE '^Merge '; then
+              continue
+            fi
+            if ! echo "$msg" | grep -qE '^Changelog-(Added|Changed|Fixed|Removed|None):'; then
+              echo "FAIL: Commit $sha is missing a Changelog trailer:"
+              echo "$msg" | head -5
+              echo "---"
+              fail=1
+            fi
+          done
+          if [ "$fail" -eq 1 ]; then
+            echo ""
+            echo "Every commit must have a Changelog-{Added,Changed,Fixed,Removed,None} trailer."
+            exit 1
+          fi
+
+  lint:
     name: Rustfmt + Clippy
     runs-on: ubuntu-22.04
     steps:
@@ -18,6 +52,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: |
           cargo fmt --all -- --check
           cargo clippy
@@ -30,6 +66,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
+      - uses: Swatinem/rust-cache@v2
       - name: Setup Java JDK
         uses: actions/setup-java@v4.5.0
         with:
@@ -50,7 +87,21 @@ jobs:
     with:
       os: ubuntu-22.04
       additional-setup: |
-        sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libspeechd-dev libxkbcommon-dev libssl-dev
+        sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libspeechd-dev libxkbcommon-dev libssl-dev libasound2-dev
+
+  snapshot-test:
+    name: Snapshot Tests
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libspeechd-dev libxkbcommon-dev libssl-dev libasound2-dev mesa-vulkan-drivers
+      - name: Run snapshot tests
+        run: ./scripts/snapshot-test
 
   macos-test:
     name: Test (macOS)
@@ -68,35 +119,67 @@ jobs:
     name: rpm/deb
     runs-on: ubuntu-22.04
     needs: linux-test
-    if: github.ref_name == 'master' || github.ref_name == 'ci'
+    if: github.ref_name == 'master' || github.ref_name == 'ci' || github.event_name == 'release'
 
     strategy:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
 
+    env:
+      PKG_CONFIG_ALLOW_CROSS: 1
+      PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+
     steps:
       # Checkout the repository
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - uses: Swatinem/rust-cache@v2
+
       # Install Packaging Tools
       - name: Install Packaging Tools
         run: |
           sudo apt-get update
+          sudo apt-get install -y libasound2-dev
           if [ "${{ matrix.arch }}" != "$(uname -m)" ]; then
-            sudo apt-get install -y gcc-${{ matrix.arch }}-linux-gnu g++-aarch64-linux-gnu
+            sudo dpkg --add-architecture arm64
+            sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ jammy main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/arm64.list
+            echo "deb [arch=arm64] http://ports.ubuntu.com/ jammy-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64.list
+            sudo apt-get update
+            sudo apt-get install -y gcc-${{ matrix.arch }}-linux-gnu g++-aarch64-linux-gnu libasound2-dev:arm64
             rustup target add ${{ matrix.arch }}-unknown-linux-gnu
           fi
           cargo install cargo-generate-rpm cargo-deb
 
       - name: Build Cross (${{ matrix.arch }})
         if: matrix.arch != runner.arch
-        run: cargo build --release --target=${{ matrix.arch }}-unknown-linux-gnu
+        run: cargo build --release --workspace --exclude notedeck_release --target=${{ matrix.arch }}-unknown-linux-gnu
 
       - name: Build Native (${{ matrix.arch }})
         if: matrix.arch == runner.arch
-        run: cargo build --release
+        run: cargo build --release --workspace --exclude notedeck_release
+
+      - name: Create release tarball (Cross)
+        if: matrix.arch != runner.arch
+        run: |
+          mkdir -p packages
+          tar czf packages/notedeck-${{ matrix.arch }}-linux.tar.gz \
+            -C target/${{ matrix.arch }}-unknown-linux-gnu/release notedeck
+
+      - name: Create release tarball (Native)
+        if: matrix.arch == runner.arch
+        run: |
+          mkdir -p packages
+          tar czf packages/notedeck-${{ matrix.arch }}-linux.tar.gz \
+            -C target/release notedeck
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: notedeck-${{ matrix.arch }}-linux.tar.gz
+          path: packages/notedeck-${{ matrix.arch }}-linux.tar.gz
 
       - name: Build RPM (Cross)
         if: matrix.arch != runner.arch
@@ -147,7 +230,7 @@ jobs:
     name: macOS dmg
     runs-on: macos-latest
     needs: macos-test
-    if: github.ref_name == 'master' || github.ref_name == 'ci'
+    if: github.ref_name == 'master' || github.ref_name == 'ci' || github.event_name == 'release'
     env:
       NOTEDECK_APPLE_RELEASE_CERT_ID: ${{ secrets.NOTEDECK_APPLE_RELEASE_CERT_ID }}
       NOTEDECK_RELEASE_APPLE_ID: ${{ secrets.NOTEDECK_RELEASE_APPLE_ID }}
@@ -182,6 +265,18 @@ jobs:
       - name: Run macOS DMG Build Script
         run: ARCH=${{ matrix.arch }} ./scripts/macos_build.sh
 
+      - name: Create release tarball
+        run: |
+          mkdir -p packages
+          tar czf packages/notedeck-${{ matrix.arch }}-macos.tar.gz \
+            -C target/${{ matrix.arch }}-apple-darwin/release notedeck
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: notedeck-${{ matrix.arch }}-macos.tar.gz
+          path: packages/notedeck-${{ matrix.arch }}-macos.tar.gz
+
       - name: Upload DMG Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -192,11 +287,11 @@ jobs:
     name: Windows Installer
     runs-on: windows-latest
     needs: windows-test
-    if: github.ref_name == 'master' || github.ref_name == 'ci'
+    if: github.ref_name == 'master' || github.ref_name == 'ci' || github.event_name == 'release'
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        arch: [x86_64]
 
     steps:
       # Checkout the repository
@@ -206,10 +301,6 @@ jobs:
       # Build cache
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
-
-      # Build
-      - name: Build (Native Only)
-        run: cargo build --release
 
       # Create packages directory
       - name: Create packages directory
@@ -231,43 +322,11 @@ jobs:
           Write-Output "Building for target: $target"
           cargo build --release --target=$target
 
-      # Generate ISS Script
-      - name: Generate Inno Setup Script
-        shell: pwsh
-        run: |
-          $arch = "${{ matrix.arch }}"
-          $issContent = @"
-          [Setup]
-          AppName=Damus Notedeck
-          AppVersion=0.1
-          DefaultDirName={pf}\Notedeck
-          DefaultGroupName=Damus Notedeck
-          OutputDir=..\packages\$arch
-          OutputBaseFilename=DamusNotedeckInstaller
-          Compression=lzma
-          SolidCompression=yes
-
-          [Files]
-          Source: "..\target\$arch-pc-windows-msvc\release\notedeck.exe"; DestDir: "{app}"; Flags: ignoreversion
-
-          [Icons]
-          Name: "{group}\Damus Notedeck"; Filename: "{app}\notedeck.exe"
-
-          [Run]
-          Filename: "{app}\notedeck.exe"; Description: "Launch Damus Notedeck"; Flags: nowait postinstall skipifsilent
-          "@
-          Set-Content -Path "scripts/windows-installer-$arch.iss" -Value $issContent
-
       # Build Installer
       - name: Run Inno Setup Script
         run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "scripts\windows-installer-${{ matrix.arch }}.iss"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DBuildArch=${{ matrix.arch }} "scripts\windows-installer.iss"
 
-      # Move output
-      - name: Move Inno Script outputs to architecture-specific folder
-        run: |
-          New-Item -ItemType Directory -Force -Path packages\${{ matrix.arch }}
-          Move-Item -Path packages\${{ matrix.arch }}\DamusNotedeckInstaller.exe -Destination packages\${{ matrix.arch }}\DamusNotedeckInstaller.exe
       # Upload the installer as an artifact
       - name: Upload Installer
         uses: actions/upload-artifact@v4
@@ -279,7 +338,7 @@ jobs:
     name: Upload Artifacts to Server
     runs-on: ubuntu-22.04
     needs: [packaging, macos-dmg, windows-installer]
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/ci'
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/ci' || github.event_name == 'release'
 
     steps:
       - name: Download all Artifacts
@@ -304,6 +363,43 @@ jobs:
           put $ARTIFACTS/notedeck-aarch64.dmg/*
           put $ARTIFACTS/DamusNotedeckInstaller-x86_64.exe/*
           put $ARTIFACTS/DamusNotedeckInstaller-aarch64.exe/*
+          put $ARTIFACTS/notedeck-x86_64-linux.tar.gz/*
+          put $ARTIFACTS/notedeck-aarch64-linux.tar.gz/*
+          put $ARTIFACTS/notedeck-x86_64-macos.tar.gz/*
+          put $ARTIFACTS/notedeck-aarch64-macos.tar.gz/*
           bye
           EOF
 
+  upload-to-release:
+    name: Upload to GitHub Release
+    runs-on: ubuntu-22.04
+    needs: [packaging, macos-dmg, windows-installer]
+    if: github.event_name == 'release'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all Artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          echo "=== Downloaded artifact directories ==="
+          ls -la
+          for dir in */; do
+            echo "--- $dir ---"
+            ls -la "$dir"
+          done
+          echo "=== Uploading to release $tag ==="
+          for dir in notedeck-*.rpm notedeck-*.deb notedeck-*.dmg notedeck-*-linux.tar.gz notedeck-*-macos.tar.gz DamusNotedeckInstaller-*.exe; do
+            if [ -d "$dir" ]; then
+              for file in "$dir"/*; do
+                [ -f "$file" ] || continue
+                echo "uploading $file..."
+                gh release upload "$tag" "$file" --repo "${{ github.repository }}" --clobber
+              done
+            fi
+          done

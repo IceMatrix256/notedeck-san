@@ -1,8 +1,8 @@
-use enostr::{FilledKeypair, NoteId, Pubkey, RelayPool};
+use enostr::{FilledKeypair, NoteId, Pubkey};
 use nostrdb::{Filter, Ndb, Note, NoteBuildOptions, NoteBuilder, Transaction};
 use tracing::info;
 
-use crate::Muted;
+use crate::{Muted, PublishApi, RelayType};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ReportType {
@@ -83,7 +83,12 @@ where
     builder
 }
 
-pub fn send_note_builder(builder: NoteBuilder, ndb: &Ndb, pool: &mut RelayPool, kp: FilledKeypair) {
+pub fn publish_note_builder(
+    builder: NoteBuilder,
+    ndb: &Ndb,
+    publisher: &mut PublishApi<'_, '_>,
+    kp: FilledKeypair,
+) {
     let note = builder
         .sign(&kp.secret_key.secret_bytes())
         .build()
@@ -101,13 +106,13 @@ pub fn send_note_builder(builder: NoteBuilder, ndb: &Ndb, pool: &mut RelayPool, 
 
     let _ = ndb.process_event_with(&json, nostrdb::IngestMetadata::new().client(true));
     info!("sending {}", &json);
-    pool.send(event);
+    publisher.publish_note(&note, RelayType::AccountsWrite);
 }
 
 pub fn send_unmute_event(
     ndb: &Ndb,
     txn: &Transaction,
-    pool: &mut RelayPool,
+    publisher: &mut PublishApi<'_, '_>,
     kp: FilledKeypair,
     muted: &Muted,
     target: &Pubkey,
@@ -152,13 +157,13 @@ pub fn send_unmute_event(
         }),
     );
 
-    send_note_builder(builder, ndb, pool, kp);
+    publish_note_builder(builder, ndb, publisher, kp);
 }
 
 pub fn send_mute_event(
     ndb: &Ndb,
     txn: &Transaction,
-    pool: &mut RelayPool,
+    publisher: &mut PublishApi<'_, '_>,
     kp: FilledKeypair,
     muted: &Muted,
     target: &Pubkey,
@@ -200,12 +205,45 @@ pub fn send_mute_event(
             .tag_str(&target.hex())
     };
 
-    send_note_builder(builder, ndb, pool, kp);
+    publish_note_builder(builder, ndb, publisher, kp);
+}
+
+pub fn send_people_list_event(
+    ndb: &Ndb,
+    publisher: &mut PublishApi<'_, '_>,
+    kp: FilledKeypair,
+    name: &str,
+    members: &[Pubkey],
+) {
+    let builder = construct_people_list_note(name, members);
+
+    publish_note_builder(builder, ndb, publisher, kp);
+}
+
+/// Construct a kind-30000 NIP-51 people-list note builder with one identifier,
+/// title, and one `p` tag per member.
+pub fn construct_people_list_note<'a>(name: &str, members: &[Pubkey]) -> NoteBuilder<'a> {
+    let mut builder = NoteBuilder::new()
+        .content("")
+        .kind(30000)
+        .options(NoteBuildOptions::default())
+        .start_tag()
+        .tag_str("d")
+        .tag_str(name)
+        .start_tag()
+        .tag_str("title")
+        .tag_str(name);
+
+    for pk in members {
+        builder = builder.start_tag().tag_str("p").tag_str(&pk.hex());
+    }
+
+    builder
 }
 
 pub fn send_report_event(
     ndb: &Ndb,
-    pool: &mut RelayPool,
+    publisher: &mut PublishApi<'_, '_>,
     kp: FilledKeypair,
     target: &ReportTarget,
     report_type: ReportType,
@@ -229,5 +267,35 @@ pub fn send_report_event(
             .tag_str(report_str);
     }
 
-    send_note_builder(builder, ndb, pool, kp);
+    publish_note_builder(builder, ndb, publisher, kp);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::construct_people_list_note;
+    use enostr::FullKeypair;
+
+    #[test]
+    fn construct_people_list_note_emits_expected_nip51_tags() {
+        let owner = FullKeypair::generate();
+        let member = FullKeypair::generate();
+
+        let note = construct_people_list_note("friends", &[member.pubkey])
+            .sign(&owner.secret_key.secret_bytes())
+            .build()
+            .expect("people list note");
+
+        assert_eq!(note.kind(), 30000);
+        assert!(note
+            .tags()
+            .into_iter()
+            .any(|tag| tag.get_str(0) == Some("d") && tag.get_str(1) == Some("friends")));
+        assert!(note
+            .tags()
+            .into_iter()
+            .any(|tag| tag.get_str(0) == Some("title") && tag.get_str(1) == Some("friends")));
+        assert!(note.tags().into_iter().any(|tag| {
+            tag.get_str(0) == Some("p") && tag.get_id(1) == Some(member.pubkey.bytes())
+        }));
+    }
 }

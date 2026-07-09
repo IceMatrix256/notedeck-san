@@ -146,6 +146,8 @@ impl<'a> StatusBadge<'a> {
             Vec2::new(galley.size().x + keybind_extra, galley.size().y) + padding * 2.0;
 
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+        response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, self.text));
 
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
@@ -192,7 +194,7 @@ impl<'a> StatusBadge<'a> {
                 painter.rect_stroke(
                     box_rect,
                     3.0,
-                    egui::Stroke::new(1.0, box_stroke),
+                    egui::Stroke::new(notedeck::tokens::STROKE_THIN, box_stroke),
                     egui::StrokeKind::Inside,
                 );
 
@@ -259,6 +261,8 @@ impl<'a> ActionButton<'a> {
             Vec2::new(galley.size().x + keybind_extra, galley.size().y) + padding * 2.0;
 
         let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+        response
+            .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, self.text));
 
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
@@ -300,7 +304,7 @@ impl<'a> ActionButton<'a> {
                 painter.rect_stroke(
                     box_rect,
                     3.0,
-                    egui::Stroke::new(1.0, Color32::WHITE),
+                    egui::Stroke::new(notedeck::tokens::STROKE_THIN, Color32::WHITE),
                     egui::StrokeKind::Inside,
                 );
 

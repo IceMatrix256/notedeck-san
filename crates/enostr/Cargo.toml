@@ -5,6 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["tokio-websocket"]
+tokio-websocket = ["ewebsock/tokio"]
+
 [dependencies]
 ewebsock = { version = "0.8.0", features = ["tls"] }
 serde_derive = { workspace = true }
@@ -18,9 +22,22 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
 mio = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 tokenator = { workspace = true }
 hashbrown = { workspace = true }
+slab = { workspace = true }
 hkdf = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
+negentropy = { workspace = true }
+uuid = { workspace = true }
+profiling = { workspace = true }
+
+[dev-dependencies]
+nostr-database = "0.37"
+nostr-relay-builder = "0.37"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = { workspace = true }

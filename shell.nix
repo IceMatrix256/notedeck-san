@@ -1,6 +1,6 @@
 { pkgs ? import <nixpkgs> { }
-, android ? "https://github.com/tadfisher/android-nixpkgs/archive/refs/tags/2025-01-27.tar.gz"
-, use_android ? true
+, android ? "https://github.com/tadfisher/android-nixpkgs/archive/refs/tags/2026-04-20-stable.tar.gz"
+, use_android ? false
 , android_emulator ? false
 }:
 with pkgs;
@@ -16,6 +16,7 @@ mkShell ({
     rustup
     gdb
     libiconv
+    (python3.withPackages (ps: [ ps.pyyaml ps.mako ps.requests ]))
     pkg-config
     cmake
     fontconfig
@@ -26,6 +27,7 @@ mkShell ({
     #gdb
     #heaptrack
   ] ++ lib.optionals (!stdenv.isDarwin) [
+    alsa-lib
     zenity
   ] ++ lib.optionals use_android [
     gradle
@@ -43,6 +45,8 @@ mkShell ({
 } // (
   lib.optionalAttrs (!stdenv.isDarwin) {
     LD_LIBRARY_PATH = "${x11libs}";
+    # Lavapipe ICD path for deterministic snapshot tests (software Vulkan)
+    LAVAPIPE_ICD = "${mesa.drivers}/share/vulkan/icd.d/lvp_icd.x86_64.json";
     #XDG_DATA_DIRS = "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}";
   }
 ) // (
@@ -50,15 +54,15 @@ mkShell ({
     let
       android-nixpkgs = callPackage (fetchTarball android) { };
       #ndk-version = "24.0.8215888";
-      ndk-version = "27.2.12479018";
-      android-version = "31";
+      ndk-version = "29.0.14206865";
+      android-version = "34";
 
       android-sdk = android-nixpkgs.sdk (sdkPkgs: with sdkPkgs; [
         cmdline-tools-latest
         build-tools-34-0-0
         platform-tools
-        platforms-android-31
-        ndk-27-2-12479018
+        platforms-android-34
+        ndk-29-0-14206865
         #ndk-24-0-8215888
       ] ++ lib.optional android_emulator emulator);
 

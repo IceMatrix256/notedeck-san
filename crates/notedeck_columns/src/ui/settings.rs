@@ -1,23 +1,25 @@
 use egui::{
-    vec2, Button, Color32, ComboBox, CornerRadius, FontId, Frame, Layout, Margin, RichText,
-    ScrollArea, TextEdit, ThemePreference,
+    vec2, Button, Color32, ComboBox, CornerRadius, Frame, Layout, Margin, RichText, ScrollArea,
+    TextEdit, ThemePreference,
 };
 use egui_extras::{Size, StripBuilder};
-use enostr::NoteId;
-use nostrdb::Transaction;
 use notedeck::{
-    tr, ui::richtext_small, DragResponse, Images, LanguageIdentifier, Localization, NoteContext,
-    NotedeckTextStyle, Settings, SettingsHandler, DEFAULT_MAX_HASHTAGS_PER_NOTE,
-    DEFAULT_NOTE_BODY_FONT_SIZE,
+    tr, ui::richtext_small, DragResponse, LanguageIdentifier, NoteContext, NotedeckTextStyle,
+    Settings, DEFAULT_MAX_HASHTAGS_PER_NOTE,
 };
 use notedeck_ui::{
     app_images::{copy_to_clipboard_dark_image, copy_to_clipboard_image},
     AnimationHelper, NoteOptions, NoteView,
 };
 
+use nostrdb::Transaction;
+
 use crate::{nav::RouterAction, ui::account_login_view::eye_button, Damus, Route};
 
-const PREVIEW_NOTE_ID: &str = "note1edjc8ggj07hwv77g2405uh6j2jkk5aud22gktxrvc2wnre4vdwgqzlv2gw";
+const PREVIEW_NOTE_ID: [u8; 32] = [
+    0xcb, 0x65, 0x83, 0xa1, 0x12, 0x7f, 0xae, 0xe6, 0x7b, 0xc8, 0x55, 0x5f, 0x4e, 0x5f, 0x52, 0x54,
+    0xad, 0x6a, 0x77, 0x8d, 0x52, 0x91, 0x65, 0x98, 0x6c, 0xc2, 0x9d, 0x31, 0xe6, 0xac, 0x6b, 0x90,
+];
 
 const MIN_ZOOM: f32 = 0.5;
 const MAX_ZOOM: f32 = 3.0;
@@ -29,23 +31,23 @@ pub enum SettingsAction {
     SetTheme(ThemePreference),
     SetLocale(LanguageIdentifier),
     SetRepliestNewestFirst(bool),
-    SetNoteBodyFontSize(f32),
     SetAnimateNavTransitions(bool),
     SetMaxHashtagsPerNote(usize),
+    SetReleaseChannel(String),
     OpenRelays,
     OpenCacheFolder,
     ClearCacheFolder,
+    CompactDatabase,
+    SetSoundsEnabled(bool),
+    SetSoundVolume(f32),
 }
 
 impl SettingsAction {
-    pub fn process_settings_action<'a>(
+    pub fn process_settings_action(
         self,
         app: &mut Damus,
-        settings: &'a mut SettingsHandler,
-        i18n: &'a mut Localization,
-        img_cache: &mut Images,
-        ctx: &egui::Context,
-        accounts: &mut notedeck::Accounts,
+        app_ctx: &mut notedeck::AppContext<'_>,
+        egui_ctx: &egui::Context,
     ) -> Option<RouterAction> {
         let mut route_action: Option<RouterAction> = None;
 
@@ -54,47 +56,80 @@ impl SettingsAction {
                 route_action = Some(RouterAction::route_to(Route::Relays));
             }
             Self::SetZoomFactor(zoom_factor) => {
-                ctx.set_zoom_factor(zoom_factor);
-                settings.set_zoom_factor(zoom_factor);
+                egui_ctx.set_zoom_factor(zoom_factor);
+                app_ctx.settings.set_zoom_factor(zoom_factor);
             }
             Self::SetTheme(theme) => {
-                ctx.set_theme(theme);
-                settings.set_theme(theme);
+                egui_ctx.set_theme(theme);
+                app_ctx.settings.set_theme(theme);
             }
             Self::SetLocale(language) => {
-                if i18n.set_locale(language.clone()).is_ok() {
-                    settings.set_locale(language.to_string());
+                if app_ctx.i18n.set_locale(language.clone()).is_ok() {
+                    app_ctx.settings.set_locale(language.to_string());
                 }
             }
             Self::SetRepliestNewestFirst(value) => {
                 app.note_options.set(NoteOptions::RepliesNewestFirst, value);
-                settings.set_show_replies_newest_first(value);
+                app_ctx.settings.set_show_replies_newest_first(value);
             }
             Self::OpenCacheFolder => {
                 use opener;
-                let _ = opener::open(img_cache.base_path.clone());
+                let _ = opener::open(app_ctx.img_cache.base_path.clone());
             }
             Self::ClearCacheFolder => {
-                let _ = img_cache.clear_folder_contents();
+                let _ = app_ctx.img_cache.clear_folder_contents();
             }
-            Self::SetNoteBodyFontSize(size) => {
-                let mut style = (*ctx.style()).clone();
-                style.text_styles.insert(
-                    NotedeckTextStyle::NoteBody.text_style(),
-                    FontId::proportional(size),
-                );
-                ctx.set_style(style);
-
-                settings.set_note_body_font_size(size);
-            }
-
             Self::SetAnimateNavTransitions(value) => {
-                settings.set_animate_nav_transitions(value);
+                app_ctx.settings.set_animate_nav_transitions(value);
             }
 
             Self::SetMaxHashtagsPerNote(value) => {
-                settings.set_max_hashtags_per_note(value);
-                accounts.update_max_hashtags_per_note(value);
+                app_ctx.settings.set_max_hashtags_per_note(value);
+                app_ctx.accounts.update_max_hashtags_per_note(value);
+            }
+            Self::SetSoundsEnabled(value) => {
+                app_ctx.sound.set_enabled(value);
+                app_ctx.settings.set_sounds_enabled(value);
+            }
+            Self::SetSoundVolume(value) => {
+                app_ctx.sound.set_volume(value);
+                app_ctx.settings.set_sound_volume(value);
+            }
+            Self::SetReleaseChannel(channel) => {
+                app_ctx.settings.set_release_channel(&channel);
+            }
+            Self::CompactDatabase => {
+                let own_pubkeys: Vec<[u8; 32]> = app_ctx
+                    .accounts
+                    .cache
+                    .accounts()
+                    .map(|a| *a.key.pubkey.bytes())
+                    .collect();
+
+                let db_path = app_ctx.args.db_path(app_ctx.path);
+                let compact_path = app_ctx.args.db_compact_path(app_ctx.path);
+                let _ = std::fs::create_dir_all(&compact_path);
+
+                let old_size = std::fs::metadata(db_path.join("data.mdb"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+
+                let compact_path_str = compact_path.to_str().unwrap_or("").to_string();
+                let ndb = app_ctx.ndb.clone();
+
+                let receiver = app_ctx.job_pool.schedule_receivable(move || {
+                    ndb.compact(&compact_path_str, &own_pubkeys)
+                        .map(|()| {
+                            let new_size =
+                                std::fs::metadata(format!("{compact_path_str}/data.mdb"))
+                                    .map(|m| m.len())
+                                    .unwrap_or(0);
+                            notedeck::compact::CompactResult { old_size, new_size }
+                        })
+                        .map_err(|e| format!("{e}"))
+                });
+
+                app.view_state.compact.status = notedeck::compact::CompactStatus::Running(receiver);
             }
         }
         route_action
@@ -104,7 +139,8 @@ impl SettingsAction {
 pub struct SettingsView<'a> {
     settings: &'a mut Settings,
     note_context: &'a mut NoteContext<'a>,
-    note_options: &'a mut NoteOptions,
+    db_path: &'a std::path::Path,
+    compact: &'a mut notedeck::compact::CompactState,
 }
 
 fn settings_group<S>(ui: &mut egui::Ui, title: S, contents: impl FnOnce(&mut egui::Ui))
@@ -130,12 +166,14 @@ impl<'a> SettingsView<'a> {
     pub fn new(
         settings: &'a mut Settings,
         note_context: &'a mut NoteContext<'a>,
-        note_options: &'a mut NoteOptions,
+        db_path: &'a std::path::Path,
+        compact: &'a mut notedeck::compact::CompactState,
     ) -> Self {
         Self {
             settings,
             note_context,
-            note_options,
+            db_path,
+            compact,
         }
     }
 
@@ -159,60 +197,8 @@ impl<'a> SettingsView<'a> {
             "Appearance",
             "Label for appearance settings section",
         );
+        let txn = Transaction::new(self.note_context.ndb).unwrap();
         settings_group(ui, title, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(richtext_small(tr!(
-                    self.note_context.i18n,
-                    "Font size:",
-                    "Label for font size, Appearance settings section",
-                )));
-
-                if ui
-                    .add(
-                        egui::Slider::new(&mut self.settings.note_body_font_size, 8.0..=32.0)
-                            .text(""),
-                    )
-                    .changed()
-                {
-                    action = Some(SettingsAction::SetNoteBodyFontSize(
-                        self.settings.note_body_font_size,
-                    ));
-                };
-
-                if ui
-                    .button(richtext_small(tr!(
-                        self.note_context.i18n,
-                        "Reset",
-                        "Label for reset note body font size, Appearance settings section",
-                    )))
-                    .clicked()
-                {
-                    action = Some(SettingsAction::SetNoteBodyFontSize(
-                        DEFAULT_NOTE_BODY_FONT_SIZE,
-                    ));
-                }
-            });
-
-            let txn = Transaction::new(self.note_context.ndb).unwrap();
-
-            if let Some(note_id) = NoteId::from_bech(PREVIEW_NOTE_ID) {
-                if let Ok(preview_note) =
-                    self.note_context.ndb.get_note_by_id(&txn, note_id.bytes())
-                {
-                    notedeck_ui::padding(8.0, ui, |ui| {
-                        if notedeck::ui::is_narrow(ui.ctx()) {
-                            ui.set_max_width(ui.available_width());
-
-                            NoteView::new(self.note_context, &preview_note, *self.note_options)
-                                .actionbar(false)
-                                .options_button(false)
-                                .show(ui);
-                        }
-                    });
-                    ui.separator();
-                }
-            }
-
             let current_zoom = ui.ctx().zoom_factor();
 
             ui.horizontal_wrapped(|ui| {
@@ -333,6 +319,17 @@ impl<'a> SettingsView<'a> {
                     action = Some(SettingsAction::SetTheme(ThemePreference::Dark));
                 }
             });
+
+            if let Ok(preview_note) = self.note_context.ndb.get_note_by_id(&txn, &PREVIEW_NOTE_ID) {
+                notedeck_ui::padding(8.0, ui, |ui| {
+                    ui.set_max_width(ui.available_width());
+
+                    NoteView::new(self.note_context, &preview_note, NoteOptions::default())
+                        .actionbar(false)
+                        .options_button(false)
+                        .show(ui);
+                });
+            }
         });
 
         action
@@ -440,6 +437,177 @@ impl<'a> SettingsView<'a> {
         action
     }
 
+    pub fn database_section(&mut self, ui: &mut egui::Ui) -> Option<SettingsAction> {
+        let id = ui.id();
+        let mut action: Option<SettingsAction> = None;
+
+        // Poll compaction status; invalidate cached size when done
+        if self.compact.status.poll() {
+            self.compact.invalidate_size();
+        }
+
+        let title = tr!(
+            self.note_context.i18n,
+            "Database",
+            "Label for database settings section"
+        );
+        settings_group(ui, title, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let db_size = self.compact.db_size(self.db_path);
+
+                ui.label(
+                    RichText::new(format!(
+                        "{} {}",
+                        tr!(
+                            self.note_context.i18n,
+                            "Database size:",
+                            "Label for database size in settings"
+                        ),
+                        format_size(db_size)
+                    ))
+                    .text_style(NotedeckTextStyle::Small.text_style()),
+                );
+
+                ui.end_row();
+
+                match self.compact.status {
+                    notedeck::compact::CompactStatus::Running(_) => {
+                        ui.label(
+                            richtext_small(tr!(
+                                self.note_context.i18n,
+                                "Compacting...",
+                                "Status label while database compaction is running"
+                            )),
+                        );
+                    }
+                    notedeck::compact::CompactStatus::Done(ref result) => {
+                        ui.label(richtext_small(format!(
+                            "{} {} → {}. {}",
+                            tr!(
+                                self.note_context.i18n,
+                                "Compacted!",
+                                "Status label after database compaction completes"
+                            ),
+                            format_size(result.old_size),
+                            format_size(result.new_size),
+                            tr!(
+                                self.note_context.i18n,
+                                "Restart to apply.",
+                                "Instruction to restart after compaction"
+                            ),
+                        )));
+                    }
+                    notedeck::compact::CompactStatus::Error(ref e) => {
+                        ui.label(
+                            richtext_small(format!(
+                                "{} {e}",
+                                tr!(
+                                    self.note_context.i18n,
+                                    "Compaction error:",
+                                    "Status label when database compaction fails"
+                                ),
+                            ))
+                            .color(Color32::LIGHT_RED),
+                        );
+                    }
+                    notedeck::compact::CompactStatus::Idle => {
+                        let compact_resp = ui.button(richtext_small(tr!(
+                            self.note_context.i18n,
+                            "Compact database",
+                            "Button to compact the database"
+                        )));
+
+                        let id_compact = id.with("compact_db");
+                        if compact_resp.clicked() {
+                            ui.data_mut(|d| d.insert_temp(id_compact, true));
+                        }
+
+                        if ui.data_mut(|d| *d.get_temp_mut_or_default(id_compact)) {
+                            let mut confirm_pressed = false;
+                            compact_resp.show_tooltip_ui(|ui| {
+                                ui.label(tr!(
+                                    self.note_context.i18n,
+                                    "Keeps all profiles and your notes. The smaller database will be used on next restart.",
+                                    "Confirmation prompt for database compaction"
+                                ));
+                                let confirm_resp = ui.button(tr!(
+                                    self.note_context.i18n,
+                                    "Confirm",
+                                    "Label for confirm compact database"
+                                ));
+                                if confirm_resp.clicked() {
+                                    confirm_pressed = true;
+                                }
+
+                                if confirm_resp.clicked()
+                                    || ui
+                                        .button(tr!(
+                                            self.note_context.i18n,
+                                            "Cancel",
+                                            "Label for cancel compact database"
+                                        ))
+                                        .clicked()
+                                {
+                                    ui.data_mut(|d| d.insert_temp(id_compact, false));
+                                }
+                            });
+
+                            if confirm_pressed {
+                                action = Some(SettingsAction::CompactDatabase);
+                            } else if !confirm_pressed && compact_resp.clicked_elsewhere() {
+                                ui.data_mut(|d| d.insert_temp(id_compact, false));
+                            }
+                        }
+                    }
+                }
+            });
+        });
+
+        action
+    }
+
+    fn sound_section(&mut self, ui: &mut egui::Ui) -> Option<SettingsAction> {
+        let mut action = None;
+
+        settings_group(ui, "Sound", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(richtext_small("Sound effects:"));
+
+                let label = if self.settings.sounds_enabled {
+                    "On"
+                } else {
+                    "Off"
+                };
+                if ui
+                    .toggle_value(
+                        &mut self.settings.sounds_enabled,
+                        RichText::new(label).text_style(NotedeckTextStyle::Small.text_style()),
+                    )
+                    .changed()
+                {
+                    action = Some(SettingsAction::SetSoundsEnabled(
+                        self.settings.sounds_enabled,
+                    ));
+                }
+            });
+
+            if self.settings.sounds_enabled {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(richtext_small("Volume:"));
+
+                    if ui
+                        .add(egui::Slider::new(&mut self.settings.sound_volume, 0.0..=1.0).text(""))
+                        .changed()
+                    {
+                        action = Some(SettingsAction::SetSoundVolume(self.settings.sound_volume));
+                    }
+                });
+            }
+        });
+
+        action
+    }
+
     fn other_options_section(&mut self, ui: &mut egui::Ui) -> Option<SettingsAction> {
         let mut action = None;
 
@@ -540,6 +708,29 @@ impl<'a> SettingsView<'a> {
                 ui.label(
                     richtext_small(&text).color(ui.visuals().gray_out(ui.visuals().text_color())),
                 );
+            });
+
+            ui.horizontal_wrapped(|ui| {
+                ui.label(richtext_small("Release channel:"));
+
+                let channels = ["main", "beta", "nightly", "dev"];
+                let mut selected = self.settings.release_channel.clone();
+                ComboBox::from_id_salt("release_channel")
+                    .selected_text(richtext_small(&selected))
+                    .show_ui(ui, |ui| {
+                        for ch in &channels {
+                            if ui
+                                .selectable_value(
+                                    &mut selected,
+                                    ch.to_string(),
+                                    richtext_small(*ch),
+                                )
+                                .changed()
+                            {
+                                action = Some(SettingsAction::SetReleaseChannel(selected.clone()));
+                            }
+                        }
+                    });
             });
         });
 
@@ -727,7 +918,19 @@ impl<'a> SettingsView<'a> {
 
                     ui.add_space(5.0);
 
+                    if let Some(new_action) = self.database_section(ui) {
+                        action = Some(new_action);
+                    }
+
+                    ui.add_space(5.0);
+
                     self.keys_section(ui);
+
+                    ui.add_space(5.0);
+
+                    if let Some(new_action) = self.sound_section(ui) {
+                        action = Some(new_action);
+                    }
 
                     ui.add_space(5.0);
 
@@ -769,7 +972,7 @@ pub fn format_size(size_bytes: u64) -> String {
 
 fn item_frame(ui: &egui::Ui) -> egui::Frame {
     Frame::new()
-        .inner_margin(Margin::same(8))
-        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(notedeck::tokens::SPACING_SM as i8))
+        .corner_radius(CornerRadius::same(notedeck::tokens::RADIUS_MD as u8))
         .fill(ui.visuals().panel_fill)
 }

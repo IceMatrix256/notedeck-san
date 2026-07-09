@@ -1,0 +1,596 @@
+use hashbrown::{HashMap, HashSet};
+use nostrdb::Filter;
+
+use crate::relay::{
+    same_canonical_filter_set, FullHistorySubId, MetadataFilters, NormRelayUrl, OutboxSubId,
+    RelayRoutingPreference, RelayUrlPkgs,
+};
+
+/// Filter set used for background full-history reconciliation.
+#[derive(Clone, Debug)]
+pub struct FullHistoryConfig {
+    pub(crate) filters: Vec<Filter>,
+}
+
+impl FullHistoryConfig {
+    /// Create an explicit full-history declaration with its own non-empty
+    /// filter set.
+    pub fn new(filters: Vec<Filter>) -> Self {
+        Self {
+            filters: filters
+                .into_iter()
+                .filter(|filter| filter.num_elements() != 0)
+                .collect(),
+        }
+    }
+
+    /// Returns the full-history filter set.
+    pub fn filters(&self) -> &[Filter] {
+        &self.filters
+    }
+
+    /// Returns whether this config contains no meaningful history filters.
+    pub fn is_empty(&self) -> bool {
+        self.filters.is_empty()
+    }
+}
+
+pub struct OutboxSubscription {
+    pub relays: HashSet<NormRelayUrl>,
+    pub filters: MetadataFilters,
+    json_size: usize,
+    pub is_oneshot: bool,
+    full_history_fetch: Option<FullHistoryFetchOrigin>,
+    pub routing_preference: RelayRoutingPreference,
+}
+
+/// Source full-history relay/filter pair that produced an internal fetch
+/// subscription.
+struct FullHistoryFetchOrigin {
+    owner: FullHistorySubId,
+    filter: Filter,
+}
+
+impl OutboxSubscription {
+    /// Returns the filter set that compaction should send for this
+    /// subscription, applying any synthetic `since` cursor from metadata.
+    pub fn filters_for_compaction(&self) -> Vec<Filter> {
+        self.filters.projected_filters()
+    }
+
+    pub fn see_all(&mut self, at: u64) {
+        for (_, meta) in self.filters.iter_mut() {
+            meta.last_seen = Some(at);
+        }
+    }
+
+    pub fn ingest_task(&mut self, task: ModifyTask) {
+        match task {
+            ModifyTask::Filters(modify_filters_task) => {
+                self.filters = MetadataFilters::new(modify_filters_task.0);
+                self.json_size = self.filters.json_size_sum();
+            }
+            ModifyTask::Relays(modify_relays_task) => {
+                self.relays = modify_relays_task.0;
+            }
+            ModifyTask::Full(full_modification_task) => {
+                self.filters = MetadataFilters::new(full_modification_task.filters);
+                self.json_size = self.filters.json_size_sum();
+                self.relays = full_modification_task.relays;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct OutboxSubscriptions {
+    subs: HashMap<OutboxSubId, OutboxSubscription>,
+}
+
+impl OutboxSubscriptions {
+    pub fn view(&self, id: &OutboxSubId) -> Option<SubscriptionView<'_>> {
+        let sub = self.subs.get(id)?;
+
+        Some(SubscriptionView {
+            id: *id,
+            filters: &sub.filters,
+            json_size: sub.json_size,
+            is_oneshot: sub.is_oneshot,
+        })
+    }
+
+    pub fn json_size(&self, id: &OutboxSubId) -> Option<usize> {
+        self.subs.get(id).map(|s| s.json_size)
+    }
+
+    pub fn is_oneshot(&self, id: &OutboxSubId) -> bool {
+        self.subs.get(id).is_some_and(|s| s.is_oneshot)
+    }
+
+    /// Remove relay legs from internal full-history fetches when their source
+    /// relay/filter pair no longer belongs to the owning full-history snapshot.
+    pub(in crate::relay) fn remove_full_history_fetch_relays_matching<F>(
+        &mut self,
+        owner: FullHistorySubId,
+        mut matches: F,
+    ) -> Vec<FullHistoryFetchCancellation>
+    where
+        F: FnMut(&NormRelayUrl, &Filter) -> bool,
+    {
+        let mut cancellations = Vec::new();
+        let mut empty_subs = Vec::new();
+        for (id, sub) in &mut self.subs {
+            let Some(origin) = sub.full_history_fetch.as_ref() else {
+                continue;
+            };
+            if origin.owner != owner {
+                continue;
+            }
+
+            let mut relays = Vec::new();
+            sub.relays.retain(|relay| {
+                if matches(relay, &origin.filter) {
+                    relays.push(relay.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if relays.is_empty() {
+                continue;
+            }
+
+            let removed_sub = sub.relays.is_empty();
+            if removed_sub {
+                empty_subs.push(*id);
+            }
+            cancellations.push(FullHistoryFetchCancellation {
+                id: *id,
+                relays,
+                removed_sub,
+            });
+        }
+
+        for id in empty_subs {
+            self.subs.remove(&id);
+        }
+
+        cancellations
+    }
+
+    /// Returns the dedicated/compaction routing preference for the subscription, if present.
+    pub fn routing_preference(&self, id: &OutboxSubId) -> Option<RelayRoutingPreference> {
+        self.subs.get(id).map(|s| s.routing_preference)
+    }
+
+    pub fn json_size_sum(&self, ids: &HashSet<OutboxSubId>) -> usize {
+        ids.iter()
+            .map(|id| self.subs.get(id).map_or(0, |s| s.json_size))
+            .sum()
+    }
+
+    /// Returns the compaction-projected filters for one subscription.
+    pub fn filters_for_compaction(&self, id: &OutboxSubId) -> Option<Vec<Filter>> {
+        self.subs
+            .get(id)
+            .map(OutboxSubscription::filters_for_compaction)
+    }
+
+    /// Returns all filters for a compaction REQ, projecting any stored
+    /// compaction cursor into the returned filter set without mutating the
+    /// shared subscription definition.
+    pub fn filters_all_for_compaction(&self, ids: &HashSet<OutboxSubId>) -> Vec<Filter> {
+        ids.iter()
+            .filter_map(|id| self.subs.get(id))
+            .flat_map(OutboxSubscription::filters_for_compaction)
+            .collect()
+    }
+
+    pub fn get_mut(&mut self, id: &OutboxSubId) -> Option<&mut OutboxSubscription> {
+        self.subs.get_mut(id)
+    }
+
+    pub fn get(&self, id: &OutboxSubId) -> Option<&OutboxSubscription> {
+        self.subs.get(id)
+    }
+
+    /// Returns whether an active application one-shot already covers this
+    /// relay/filter set.
+    pub(crate) fn app_oneshot_already_covers(
+        &self,
+        relay: &NormRelayUrl,
+        filters: &[Filter],
+    ) -> bool {
+        self.subs.values().any(|sub| {
+            sub.is_app_oneshot()
+                && sub.relays.contains(relay)
+                && same_canonical_filter_set(sub.filters.get_filters(), filters)
+        })
+    }
+
+    pub fn remove(&mut self, id: &OutboxSubId) {
+        self.subs.remove(id);
+    }
+
+    pub fn new_subscription(&mut self, id: OutboxSubId, task: SubscribeTask, is_oneshot: bool) {
+        self.insert_subscription(id, task, is_oneshot, None);
+    }
+
+    pub(in crate::relay) fn new_full_history_fetch_subscription(
+        &mut self,
+        id: OutboxSubId,
+        task: SubscribeTask,
+        owner: FullHistorySubId,
+        filter: Filter,
+    ) {
+        self.insert_subscription(
+            id,
+            task,
+            true,
+            Some(FullHistoryFetchOrigin { owner, filter }),
+        );
+    }
+
+    fn insert_subscription(
+        &mut self,
+        id: OutboxSubId,
+        task: SubscribeTask,
+        is_oneshot: bool,
+        full_history_fetch: Option<FullHistoryFetchOrigin>,
+    ) {
+        let filters = MetadataFilters::new(task.filters);
+        let json_size = filters.json_size_sum();
+        self.subs.insert(
+            id,
+            OutboxSubscription {
+                relays: task.relays.urls,
+                filters,
+                json_size,
+                is_oneshot,
+                full_history_fetch,
+                routing_preference: task.relays.routing_preference,
+            },
+        );
+    }
+}
+
+/// Relay work that should be unsubscribed after trimming internal fetch legs.
+pub(in crate::relay) struct FullHistoryFetchCancellation {
+    pub(in crate::relay) id: OutboxSubId,
+    pub(in crate::relay) relays: Vec<NormRelayUrl>,
+    pub(in crate::relay) removed_sub: bool,
+}
+
+impl OutboxSubscription {
+    fn is_app_oneshot(&self) -> bool {
+        self.is_oneshot && self.full_history_fetch.is_none()
+    }
+}
+
+pub struct SubscriptionView<'a> {
+    pub id: OutboxSubId,
+    pub filters: &'a MetadataFilters,
+    #[allow(dead_code)]
+    pub json_size: usize,
+    #[allow(dead_code)]
+    pub is_oneshot: bool,
+}
+
+pub enum OutboxTask {
+    Modify(ModifyTask),
+    Subscribe(SubscribeTask),
+    Unsubscribe,
+    Oneshot(SubscribeTask),
+    FullHistoryFetch(FullHistoryFetchTask),
+}
+
+pub enum ModifyTask {
+    Filters(ModifyFiltersTask),
+    Relays(ModifyRelaysTask),
+    Full(FullModificationTask),
+}
+
+#[derive(Default)]
+pub struct ModifyFiltersTask(pub Vec<Filter>);
+
+pub struct ModifyRelaysTask(pub HashSet<NormRelayUrl>);
+
+pub struct FullModificationTask {
+    pub filters: Vec<Filter>,
+    pub relays: HashSet<NormRelayUrl>,
+}
+
+pub struct SubscribeTask {
+    pub filters: Vec<Filter>,
+    pub relays: RelayUrlPkgs,
+}
+
+pub struct FullHistoryFetchTask {
+    pub(in crate::relay) owner: FullHistorySubId,
+    pub(in crate::relay) filter: Filter,
+    pub(in crate::relay) subscribe: SubscribeTask,
+}
+
+pub(in crate::relay) enum FullHistoryTask {
+    Upsert(FullHistoryUpsertTask),
+    Remove,
+}
+
+pub(in crate::relay) struct FullHistoryUpsertTask {
+    pub(in crate::relay) filters: Vec<Filter>,
+    pub(in crate::relay) relays: HashSet<NormRelayUrl>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::relay::RelayUrlPkgs;
+    use crate::relay::{FullModificationTask, ModifyFiltersTask};
+
+    fn subscribe_task(filters: Vec<Filter>, urls: RelayUrlPkgs) -> SubscribeTask {
+        SubscribeTask {
+            filters,
+            relays: urls,
+        }
+    }
+
+    fn relay_urls(url: &str) -> HashSet<NormRelayUrl> {
+        let mut urls = HashSet::new();
+        let relay = NormRelayUrl::new(url).unwrap();
+        urls.insert(relay);
+        urls
+    }
+
+    /// new_subscription should persist relay metadata and expose it via view().
+    #[test]
+    fn new_subscription_records_metadata() {
+        let mut subs = OutboxSubscriptions::default();
+        let pkgs = RelayUrlPkgs::with_preference(
+            relay_urls("wss://relay-meta.example.com"),
+            RelayRoutingPreference::PreferDedicated,
+        );
+        let filters = vec![Filter::new().kinds(vec![1]).limit(4).build()];
+        let id = OutboxSubId(7);
+
+        subs.new_subscription(id, subscribe_task(filters.clone(), pkgs), true);
+
+        let view = subs.view(&id).expect("subscription view");
+        assert_eq!(view.id, id);
+        assert!(view.is_oneshot);
+        assert_eq!(view.filters.get_filters().len(), filters.len());
+        assert!(view.json_size > 0);
+
+        let sub = subs.get_mut(&id).expect("subscription metadata");
+        assert_eq!(sub.relays.len(), 1);
+        assert_eq!(
+            sub.routing_preference,
+            RelayRoutingPreference::PreferDedicated
+        );
+    }
+
+    /// json_size_sum aggregates the JSON payload size for the requested subscriptions.
+    #[test]
+    fn json_size_sum_accumulates_sizes() {
+        let mut subs = OutboxSubscriptions::default();
+        let filters = vec![Filter::new().kinds(vec![1]).build()];
+        let id_a = OutboxSubId(1);
+        let id_b = OutboxSubId(2);
+        subs.new_subscription(
+            id_a,
+            subscribe_task(
+                filters.clone(),
+                RelayUrlPkgs::new(relay_urls("wss://relay-json-a.example")),
+            ),
+            false,
+        );
+        subs.new_subscription(
+            id_b,
+            subscribe_task(
+                filters,
+                RelayUrlPkgs::new(relay_urls("wss://relay-json-b.example")),
+            ),
+            false,
+        );
+
+        let mut ids = HashSet::new();
+        ids.insert(id_a);
+        ids.insert(id_b);
+
+        let sum = subs.json_size_sum(&ids);
+        let expected = subs.json_size(&id_a).unwrap() + subs.json_size(&id_b).unwrap();
+        assert_eq!(sum, expected);
+    }
+
+    /// see_all should mark every filter as seen at the provided timestamp.
+    #[test]
+    fn see_all_marks_filters() {
+        let mut subs = OutboxSubscriptions::default();
+        let id = OutboxSubId(8);
+        subs.new_subscription(
+            id,
+            subscribe_task(
+                vec![
+                    Filter::new().kinds(vec![1]).limit(2).build(),
+                    Filter::new().kinds(vec![4]).limit(1).build(),
+                ],
+                RelayUrlPkgs::new(relay_urls("wss://relay-see.example")),
+            ),
+            false,
+        );
+
+        let timestamp = 12345;
+        let sub = subs.get_mut(&id).expect("subscription metadata");
+        sub.see_all(timestamp);
+
+        assert!(sub
+            .filters
+            .iter()
+            .all(|(_, meta)| meta.last_seen == Some(timestamp)));
+    }
+
+    /// ingest_task should update json_size when filters are modified.
+    #[test]
+    fn ingest_task_updates_json_size_on_filter_change() {
+        let mut subs = OutboxSubscriptions::default();
+        let id = OutboxSubId(9);
+        let small_filters = vec![Filter::new().kinds(vec![1]).build()];
+        subs.new_subscription(
+            id,
+            subscribe_task(
+                small_filters,
+                RelayUrlPkgs::new(relay_urls("wss://relay-ingest.example")),
+            ),
+            false,
+        );
+
+        let original_size = subs.json_size(&id).unwrap();
+
+        // Modify with larger filters
+        let large_filters = vec![
+            Filter::new().kinds(vec![1, 2, 3, 4, 5]).limit(100).build(),
+            Filter::new().kinds(vec![6, 7, 8]).limit(50).build(),
+        ];
+        let sub = subs.get_mut(&id).unwrap();
+        sub.ingest_task(ModifyTask::Filters(ModifyFiltersTask(large_filters)));
+
+        let new_size = subs.json_size(&id).unwrap();
+        assert_ne!(
+            original_size, new_size,
+            "json_size should change after filter modification"
+        );
+        assert!(
+            new_size > original_size,
+            "larger filters should have larger json_size"
+        );
+    }
+
+    /// ingest_task with Full modification should update json_size.
+    #[test]
+    fn ingest_task_updates_json_size_on_full_change() {
+        let mut subs = OutboxSubscriptions::default();
+        let id = OutboxSubId(10);
+        let small_filters = vec![Filter::new().kinds(vec![1]).build()];
+        subs.new_subscription(
+            id,
+            subscribe_task(
+                small_filters,
+                RelayUrlPkgs::new(relay_urls("wss://relay-full.example")),
+            ),
+            false,
+        );
+
+        let original_size = subs.json_size(&id).unwrap();
+
+        // Full modification with larger filters
+        let large_filters = vec![
+            Filter::new().kinds(vec![1, 2, 3, 4, 5]).limit(100).build(),
+            Filter::new().kinds(vec![6, 7, 8]).limit(50).build(),
+        ];
+        let sub = subs.get_mut(&id).unwrap();
+        sub.ingest_task(ModifyTask::Full(FullModificationTask {
+            filters: large_filters,
+            relays: relay_urls("wss://new-relay.example"),
+        }));
+
+        let new_size = subs.json_size(&id).unwrap();
+        assert_ne!(
+            original_size, new_size,
+            "json_size should change after full modification"
+        );
+        assert!(
+            new_size > original_size,
+            "larger filters should have larger json_size"
+        );
+    }
+
+    fn filter_has_since(filter: &Filter, expected: u64) -> bool {
+        let json = filter.json().expect("filter json");
+        json.contains(&format!("\"since\":{}", expected))
+    }
+
+    /// Full-history config should preserve explicit history filters.
+    #[test]
+    fn full_history_config_preserves_limit_and_since() {
+        let filter = Filter::new().kinds(vec![1]).since(123).limit(500).build();
+
+        let config = FullHistoryConfig::new(vec![filter]);
+        let json = config.filters()[0].json().expect("filter json");
+
+        assert!(json.contains("\"since\":123"));
+        assert!(json.contains("\"limit\":500"));
+    }
+
+    /// Full flow: see_all sets last_seen, then since_optimize applies it to filters.
+    #[test]
+    fn see_all_then_since_optimize_applies_since_to_filters() {
+        let mut subs = OutboxSubscriptions::default();
+        let id = OutboxSubId(11);
+        let filters = vec![
+            Filter::new().kinds(vec![1]).build(),
+            Filter::new().kinds(vec![2]).build(),
+        ];
+        subs.new_subscription(
+            id,
+            subscribe_task(
+                filters,
+                RelayUrlPkgs::new(relay_urls("wss://relay-since.example")),
+            ),
+            false,
+        );
+
+        // Verify filters don't have since initially
+        let view = subs.view(&id).unwrap();
+        for filter in view.filters.get_filters() {
+            let json = filter.json().expect("filter json");
+            assert!(
+                !json.contains("\"since\""),
+                "filter should not have since initially"
+            );
+        }
+
+        let timestamp = 1700000000u64;
+        let sub = subs.get_mut(&id).unwrap();
+        sub.see_all(timestamp);
+        sub.filters.since_optimize();
+
+        // Verify filters now have since
+        let view = subs.view(&id).unwrap();
+        for filter in view.filters.get_filters() {
+            assert!(
+                filter_has_since(filter, timestamp),
+                "filter should have since after see_all + since_optimize"
+            );
+        }
+    }
+
+    /// Filters accessed via view() should have since after optimization.
+    #[test]
+    fn view_returns_optimized_filters() {
+        let mut subs = OutboxSubscriptions::default();
+        let id = OutboxSubId(12);
+        let filters = vec![Filter::new().kinds(vec![1]).build()];
+        subs.new_subscription(
+            id,
+            subscribe_task(
+                filters,
+                RelayUrlPkgs::new(relay_urls("wss://relay-view.example")),
+            ),
+            false,
+        );
+
+        let timestamp = 1234567890u64;
+        {
+            let sub = subs.get_mut(&id).unwrap();
+            sub.see_all(timestamp);
+            sub.filters.since_optimize();
+        }
+
+        // Access via view - should see the optimized filters
+        let view = subs.view(&id).unwrap();
+        let filter = &view.filters.get_filters()[0];
+        assert!(
+            filter_has_since(filter, timestamp),
+            "view should return filters with since applied"
+        );
+    }
+}

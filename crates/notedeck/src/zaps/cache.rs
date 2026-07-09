@@ -276,6 +276,7 @@ impl Zaps {
         states.push(*id);
     }
 
+    #[profiling::function]
     pub fn process(
         &mut self,
         accounts: &mut Accounts,
@@ -421,7 +422,7 @@ impl Zaps {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum AnyZapState {
     None,
     Pending,

@@ -1,11 +1,12 @@
 use crate::error::Error;
+use crate::nfilter::{filter_from_querystring, filter_to_querystring};
 use crate::search::SearchQuery;
 use crate::timeline::{Timeline, TimelineTab};
 use enostr::{Filter, NoteId, Pubkey};
 use nostrdb::{Ndb, Transaction};
 use notedeck::filter::{NdbQueryPackage, ValidKind};
 use notedeck::{
-    contacts::{contacts_filter, hybrid_contacts_filter},
+    contacts::{contacts_filter, hybrid_contacts_filter, hybrid_last_per_pubkey_filter},
     filter::{self, default_limit, default_remote_limit, HybridFilter},
     tr, FilterError, FilterState, Localization, NoteCache, RootIdError, RootNoteIdBuf,
 };
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use tokenator::{ParseError, TokenParser, TokenSerializable, TokenWriter};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 #[derive(Clone, Hash, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PubkeySource {
@@ -22,15 +23,25 @@ pub enum PubkeySource {
     DeckAuthor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Hash, Eq)]
+/// Reference to a NIP-51 people list (kind 30000), identified by author + "d" tag
+#[derive(Debug, Clone, PartialEq, Hash, Eq)]
+pub struct PeopleListRef {
+    pub author: Pubkey,
+    pub identifier: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Hash, Eq)]
 pub enum ListKind {
     Contact(Pubkey),
+    /// A NIP-51 people list (kind 30000)
+    PeopleList(PeopleListRef),
 }
 
 impl ListKind {
     pub fn pubkey(&self) -> Option<&Pubkey> {
         match self {
             Self::Contact(pk) => Some(pk),
+            Self::PeopleList(plr) => Some(&plr.author),
         }
     }
 }
@@ -89,30 +100,34 @@ impl ListKind {
         ListKind::Contact(pk)
     }
 
+    pub fn people_list(author: Pubkey, identifier: String) -> Self {
+        ListKind::PeopleList(PeopleListRef { author, identifier })
+    }
+
     pub fn parse<'a>(
         parser: &mut TokenParser<'a>,
         deck_author: &Pubkey,
     ) -> Result<Self, ParseError<'a>> {
-        parser.parse_all(|p| {
-            p.parse_token("contact")?;
-            let pk_src = PubkeySource::parse_from_tokens(p)?;
-            Ok(ListKind::Contact(*pk_src.as_pubkey(deck_author)))
-        })
+        let contact = parser.try_parse(|p| {
+            p.parse_all(|p| {
+                p.parse_token("contact")?;
+                let pk_src = PubkeySource::parse_from_tokens(p)?;
+                Ok(ListKind::Contact(*pk_src.as_pubkey(deck_author)))
+            })
+        });
+        if contact.is_ok() {
+            return contact;
+        }
 
-        /* here for u when you need more things to parse
-        TokenParser::alt(
-            parser,
-            &[|p| {
-                p.parse_all(|p| {
-                    p.parse_token("contact")?;
-                    let pk_src = PubkeySource::parse_from_tokens(p)?;
-                    Ok(ListKind::Contact(pk_src))
-                });
-            },|p| {
-                // more cases...
-            }],
-        )
-        */
+        parser.parse_all(|p| {
+            p.parse_token("people_list")?;
+            let pk_src = PubkeySource::parse_from_tokens(p)?;
+            let identifier = p.pull_token()?.to_string();
+            Ok(ListKind::PeopleList(PeopleListRef {
+                author: *pk_src.as_pubkey(deck_author),
+                identifier,
+            }))
+        })
     }
 
     pub fn serialize_tokens(&self, writer: &mut TokenWriter) {
@@ -120,6 +135,11 @@ impl ListKind {
             ListKind::Contact(pk) => {
                 writer.write_token("contact");
                 PubkeySource::pubkey(*pk).serialize_tokens(writer);
+            }
+            ListKind::PeopleList(plr) => {
+                writer.write_token("people_list");
+                PubkeySource::pubkey(plr.author).serialize_tokens(writer);
+                writer.write_token(&plr.identifier);
             }
         }
     }
@@ -188,6 +208,32 @@ impl PartialEq for ThreadSelection {
 
 impl Eq for ThreadSelection {}
 
+/// Stores filters as querystrings for serialization
+/// and thread safety (nostrdb::Filter is not Send).
+/// Decodes to Vec<Filter> on demand.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FilterVec(pub Vec<String>);
+
+impl FilterVec {
+    /// Create from querystrings
+    pub fn new(querystrings: Vec<String>) -> Self {
+        Self(querystrings)
+    }
+
+    /// Create from Filters by encoding them as querystrings
+    pub fn from_filters(filters: &[Filter]) -> Self {
+        Self(filters.iter().map(filter_to_querystring).collect())
+    }
+
+    /// Decode stored querystrings to Filters
+    pub fn to_filters(&self) -> Vec<Filter> {
+        self.0
+            .iter()
+            .filter_map(|s| filter_from_querystring(s))
+            .collect()
+    }
+}
+
 ///
 /// What kind of timeline is it?
 ///   - Follow List
@@ -211,8 +257,8 @@ pub enum TimelineKind {
 
     Universe,
 
-    /// Generic filter, references a hash of a filter
-    Generic(u64),
+    /// Custom filter timeline
+    Generic(FilterVec),
 
     Hashtag(Vec<String>),
 }
@@ -221,7 +267,7 @@ const NOTIFS_TOKEN_DEPRECATED: &str = "notifs";
 const NOTIFS_TOKEN: &str = "notifications";
 
 /// Hardcoded algo timelines
-#[derive(Debug, Hash, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Hash, Clone, PartialEq, Eq)]
 pub enum AlgoTimeline {
     /// LastPerPubkey: a special nostr query that fetches the last N
     /// notes for each pubkey on the list
@@ -334,6 +380,12 @@ impl TimelineKind {
         }
     }
 
+    /// Whether this timeline should show a refresh button. Used for feeds
+    /// where the remote filter uses non-deterministic sampling.
+    pub fn needs_refresh_button(&self) -> bool {
+        matches!(self, TimelineKind::Algo(AlgoTimeline::LastPerPubkey(_)))
+    }
+
     // NOTE!!: if you just added a TimelineKind enum, make sure to update
     //         the parser below as well
     pub fn serialize_tokens(&self, writer: &mut TokenWriter) {
@@ -355,9 +407,11 @@ impl TimelineKind {
             TimelineKind::Universe => {
                 writer.write_token("universe");
             }
-            TimelineKind::Generic(_usize) => {
-                // TODO: lookup filter and then serialize
+            TimelineKind::Generic(filter_vec) => {
                 writer.write_token("generic");
+                for qs in &filter_vec.0 {
+                    writer.write_token(qs);
+                }
             }
             TimelineKind::Hashtag(ht) => {
                 writer.write_token("hashtag");
@@ -410,8 +464,16 @@ impl TimelineKind {
                 },
                 |p| {
                     p.parse_token("generic")?;
-                    // TODO: generic filter serialization
-                    Ok(TimelineKind::Generic(0))
+                    let mut querystrings = Vec::new();
+                    while let Ok(token) = p.try_parse(|p| p.pull_token()) {
+                        if filter_from_querystring(token).is_some() {
+                            querystrings.push(token.to_string());
+                        } else {
+                            p.unpop_token();
+                            break;
+                        }
+                    }
+                    Ok(TimelineKind::Generic(FilterVec::new(querystrings)))
                 },
                 |p| {
                     p.parse_token("hashtag")?;
@@ -440,6 +502,10 @@ impl TimelineKind {
         TimelineKind::List(ListKind::contact_list(pk))
     }
 
+    pub fn people_list(author: Pubkey, identifier: String) -> Self {
+        TimelineKind::List(ListKind::people_list(author, identifier))
+    }
+
     pub fn search(s: String) -> Self {
         TimelineKind::Search(SearchQuery::new(s))
     }
@@ -461,6 +527,7 @@ impl TimelineKind {
     }
 
     // TODO: probably should set default limit here
+    /// Build the filter state for this timeline kind.
     pub fn filters(&self, txn: &Transaction, ndb: &Ndb) -> FilterState {
         match self {
             TimelineKind::Search(s) => FilterState::ready(search_filter(s)),
@@ -469,6 +536,7 @@ impl TimelineKind {
 
             TimelineKind::List(list_k) => match list_k {
                 ListKind::Contact(pubkey) => contact_filter_state(txn, ndb, pubkey),
+                ListKind::PeopleList(plr) => people_list_filter_state(txn, ndb, plr),
             },
 
             // TODO: still need to update this to fetch likes, zaps, etc
@@ -476,31 +544,18 @@ impl TimelineKind {
                 FilterState::ready(vec![notifications_filter(pubkey)])
             }
 
-            TimelineKind::Hashtag(hashtag) => {
-                let filters = hashtag
-                    .iter()
-                    .filter(|tag| !tag.is_empty())
-                    .map(|tag| {
-                        Filter::new()
-                            .kinds([1])
-                            .limit(filter::default_limit())
-                            .tags([tag.to_lowercase().as_str()], 't')
-                            .build()
-                    })
-                    .collect::<Vec<_>>();
-
-                FilterState::ready(filters)
-            }
+            TimelineKind::Hashtag(hashtag) => hashtag_filter_state(hashtag),
 
             TimelineKind::Algo(algo_timeline) => match algo_timeline {
                 AlgoTimeline::LastPerPubkey(list_k) => match list_k {
-                    ListKind::Contact(pubkey) => last_per_pubkey_filter_state(ndb, pubkey),
+                    ListKind::Contact(pubkey) => last_per_pubkey_filter_state(txn, ndb, pubkey),
+                    ListKind::PeopleList(plr) => {
+                        people_list_last_per_pubkey_filter_state(txn, ndb, plr)
+                    }
                 },
             },
 
-            TimelineKind::Generic(_) => {
-                todo!("implement generic filter lookups")
-            }
+            TimelineKind::Generic(filter_vec) => generic_filter_state(filter_vec),
 
             TimelineKind::Profile(pk) => FilterState::ready_hybrid(profile_filter(pk.bytes())),
         }
@@ -523,10 +578,13 @@ impl TimelineKind {
                 TimelineTab::full_tabs(),
             )),
 
-            TimelineKind::Generic(_filter_id) => {
-                warn!("you can't convert a TimelineKind::Generic to a Timeline");
-                // TODO: you actually can! just need to look up the filter id
-                None
+            TimelineKind::Generic(filter_vec) => {
+                let filter_state = generic_filter_state(&filter_vec);
+                Some(Timeline::new(
+                    TimelineKind::Generic(filter_vec),
+                    filter_state,
+                    TimelineTab::full_tabs(),
+                ))
             }
 
             TimelineKind::Algo(AlgoTimeline::LastPerPubkey(ListKind::Contact(pk))) => {
@@ -591,6 +649,46 @@ impl TimelineKind {
                 contact_filter_state(txn, ndb, &pk),
                 TimelineTab::full_tabs(),
             )),
+
+            TimelineKind::List(ListKind::PeopleList(plr)) => Some(Timeline::new(
+                TimelineKind::List(ListKind::PeopleList(plr.clone())),
+                people_list_filter_state(txn, ndb, &plr),
+                TimelineTab::full_tabs(),
+            )),
+
+            TimelineKind::Algo(AlgoTimeline::LastPerPubkey(ListKind::PeopleList(plr))) => {
+                let list_filter = people_list_note_filter(&plr);
+                let results = ndb
+                    .query(txn, std::slice::from_ref(&list_filter), 1)
+                    .expect("people list query failed?");
+
+                let list_kind = ListKind::PeopleList(plr);
+                let kind_fn = TimelineKind::last_per_pubkey;
+                let tabs = TimelineTab::only_notes_and_replies();
+
+                if results.is_empty() {
+                    return Some(Timeline::new(
+                        kind_fn(list_kind),
+                        FilterState::needs_remote(),
+                        tabs,
+                    ));
+                }
+
+                match Timeline::last_per_pubkey(&results[0].note, &list_kind) {
+                    Err(Error::App(notedeck::Error::Filter(
+                        FilterError::EmptyContactList | FilterError::EmptyList,
+                    ))) => Some(Timeline::new(
+                        kind_fn(list_kind),
+                        FilterState::needs_remote(),
+                        tabs,
+                    )),
+                    Err(e) => {
+                        error!("Unexpected error: {e}");
+                        None
+                    }
+                    Ok(tl) => Some(tl),
+                }
+            }
         }
     }
 
@@ -603,6 +701,7 @@ impl TimelineKind {
                 ListKind::Contact(_pubkey_source) => {
                     ColumnTitle::formatted(tr!(i18n, "Contacts", "Column title for contact lists"))
                 }
+                ListKind::PeopleList(plr) => ColumnTitle::formatted(plr.identifier.clone()),
             },
             TimelineKind::Algo(AlgoTimeline::LastPerPubkey(list_kind)) => match list_kind {
                 ListKind::Contact(_pubkey_source) => ColumnTitle::formatted(tr!(
@@ -610,6 +709,9 @@ impl TimelineKind {
                     "Contacts (last notes)",
                     "Column title for last notes per contact"
                 )),
+                ListKind::PeopleList(plr) => {
+                    ColumnTitle::formatted(format!("{} (last notes)", plr.identifier))
+                }
             },
             TimelineKind::Notifications(_pubkey_source) => {
                 ColumnTitle::formatted(tr!(i18n, "Notifications", "Column title for notifications"))
@@ -685,12 +787,17 @@ impl<'a> ColumnTitle<'a> {
     }
 }
 
+/// Build the filter state for a contact list timeline.
 fn contact_filter_state(txn: &Transaction, ndb: &Ndb, pk: &Pubkey) -> FilterState {
     let contact_filter = contacts_filter(pk);
 
-    let results = ndb
-        .query(txn, std::slice::from_ref(&contact_filter), 1)
-        .expect("contact query failed?");
+    let results = match ndb.query(txn, std::slice::from_ref(&contact_filter), 1) {
+        Ok(results) => results,
+        Err(err) => {
+            error!("contact query failed: {err}");
+            return FilterState::Broken(FilterError::EmptyContactList);
+        }
+    };
 
     if results.is_empty() {
         FilterState::needs_remote()
@@ -709,20 +816,23 @@ fn contact_filter_state(txn: &Transaction, ndb: &Ndb, pk: &Pubkey) -> FilterStat
     }
 }
 
-fn last_per_pubkey_filter_state(ndb: &Ndb, pk: &Pubkey) -> FilterState {
+/// Build the filter state for a last-per-pubkey timeline.
+fn last_per_pubkey_filter_state(txn: &Transaction, ndb: &Ndb, pk: &Pubkey) -> FilterState {
     let contact_filter = contacts_filter(pk.bytes());
 
-    let txn = Transaction::new(ndb).expect("txn");
-    let results = ndb
-        .query(&txn, std::slice::from_ref(&contact_filter), 1)
-        .expect("contact query failed?");
+    let results = match ndb.query(txn, std::slice::from_ref(&contact_filter), 1) {
+        Ok(results) => results,
+        Err(err) => {
+            error!("contact query failed: {err}");
+            return FilterState::Broken(FilterError::EmptyContactList);
+        }
+    };
 
     if results.is_empty() {
         FilterState::needs_remote()
     } else {
-        let kind = 1;
         let notes_per_pk = 1;
-        match filter::last_n_per_pubkey_from_tags(&results[0].note, kind, notes_per_pk) {
+        match hybrid_last_per_pubkey_filter(&results[0].note, notes_per_pk) {
             Err(notedeck::Error::Filter(FilterError::EmptyContactList)) => {
                 FilterState::needs_remote()
             }
@@ -730,7 +840,7 @@ fn last_per_pubkey_filter_state(ndb: &Ndb, pk: &Pubkey) -> FilterState {
                 error!("Error getting contact filter state: {err}");
                 FilterState::Broken(FilterError::EmptyContactList)
             }
-            Ok(filter) => FilterState::ready(filter),
+            Ok(filter) => FilterState::ready_hybrid(filter),
         }
     }
 }
@@ -770,4 +880,148 @@ fn search_filter(s: &SearchQuery) -> Vec<Filter> {
 
 fn universe_filter() -> Vec<Filter> {
     vec![Filter::new().kinds([1]).limit(default_limit()).build()]
+}
+
+/// Filter to fetch a kind 30000 people list event by author + d tag
+pub fn people_list_note_filter(plr: &PeopleListRef) -> Filter {
+    Filter::new()
+        .authors([plr.author.bytes()])
+        .kinds([30000])
+        .tags([plr.identifier.as_str()], 'd')
+        .limit(1)
+        .build()
+}
+
+/// Build the filter state for a people list timeline.
+fn people_list_filter_state(txn: &Transaction, ndb: &Ndb, plr: &PeopleListRef) -> FilterState {
+    let list_filter = people_list_note_filter(plr);
+
+    let results = match ndb.query(txn, std::slice::from_ref(&list_filter), 1) {
+        Ok(results) => results,
+        Err(err) => {
+            error!("people list query failed: {err}");
+            return FilterState::Broken(FilterError::EmptyList);
+        }
+    };
+
+    if results.is_empty() {
+        FilterState::needs_remote()
+    } else {
+        let with_hashtags = false;
+        match hybrid_contacts_filter(&results[0].note, None, with_hashtags) {
+            Err(notedeck::Error::Filter(FilterError::EmptyContactList)) => {
+                FilterState::needs_remote()
+            }
+            Err(err) => {
+                error!("Error getting people list filter state: {err}");
+                FilterState::Broken(FilterError::EmptyList)
+            }
+            Ok(filter) => FilterState::ready_hybrid(filter),
+        }
+    }
+}
+
+/// Build the filter state for a last-per-pubkey timeline backed by a people list.
+fn people_list_last_per_pubkey_filter_state(
+    txn: &Transaction,
+    ndb: &Ndb,
+    plr: &PeopleListRef,
+) -> FilterState {
+    let list_filter = people_list_note_filter(plr);
+
+    let results = match ndb.query(txn, std::slice::from_ref(&list_filter), 1) {
+        Ok(results) => results,
+        Err(err) => {
+            error!("people list query failed: {err}");
+            return FilterState::Broken(FilterError::EmptyList);
+        }
+    };
+
+    if results.is_empty() {
+        FilterState::needs_remote()
+    } else {
+        let notes_per_pk = 1;
+        match hybrid_last_per_pubkey_filter(&results[0].note, notes_per_pk) {
+            Err(notedeck::Error::Filter(FilterError::EmptyContactList)) => {
+                FilterState::needs_remote()
+            }
+            Err(err) => {
+                error!("Error getting people list filter state: {err}");
+                FilterState::Broken(FilterError::EmptyList)
+            }
+            Ok(filter) => FilterState::ready_hybrid(filter),
+        }
+    }
+}
+
+pub(super) fn hashtag_filter_state(hashtag: &[String]) -> FilterState {
+    let mut filters = Vec::new();
+    for tag in hashtag.iter().filter(|tag| !tag.is_empty()) {
+        let tag_lower = tag.to_lowercase();
+        filters.push(
+            Filter::new()
+                .kinds([1])
+                .limit(filter::default_limit())
+                .tags([tag_lower.as_str()], 't')
+                .build(),
+        );
+    }
+
+    if filters.is_empty() {
+        warn!(?hashtag, "hashtag timeline has no usable tags");
+        return FilterState::broken(FilterError::EmptyList);
+    }
+
+    if filters.len() != hashtag.len() {
+        debug!(
+            ?hashtag,
+            usable_tags = filters.len(),
+            "hashtag timeline dropped empty tags"
+        );
+    }
+
+    FilterState::ready(filters)
+}
+
+fn generic_filter_state(filter_vec: &FilterVec) -> FilterState {
+    let filters = filter_vec.to_filters();
+    if filters.is_empty() {
+        warn!(?filter_vec, "generic timeline has no usable filters");
+        return FilterState::broken(FilterError::EmptyList);
+    }
+
+    FilterState::ready(filters)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_hashtag_filter_state_is_broken() {
+        assert!(matches!(
+            hashtag_filter_state(&["".to_owned()]),
+            FilterState::Broken(FilterError::EmptyList)
+        ));
+    }
+
+    #[test]
+    fn empty_generic_timeline_filter_state_is_broken() {
+        let tmp = tempfile::TempDir::new().expect("tmp dir");
+        let ndb =
+            Ndb::new(tmp.path().to_str().expect("path"), &nostrdb::Config::new()).expect("ndb");
+        let txn = Transaction::new(&ndb).expect("txn");
+        let kind = TimelineKind::Generic(FilterVec::new(Vec::new()));
+
+        assert!(matches!(
+            kind.filters(&txn, &ndb),
+            FilterState::Broken(FilterError::EmptyList)
+        ));
+
+        let timeline = kind.into_timeline(&txn, &ndb).expect("timeline");
+        assert!(matches!(
+            timeline.filter,
+            FilterState::Broken(FilterError::EmptyList)
+        ));
+    }
 }

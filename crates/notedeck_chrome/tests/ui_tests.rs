@@ -1,0 +1,357 @@
+use egui_kittest::kittest::Queryable;
+use egui_kittest::Harness;
+use notedeck::{App, Notedeck};
+use notedeck_columns::Damus;
+
+// ---------------------------------------------------------------------------
+// Phase 2a: Pure egui smoke tests (no notedeck state)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn smoke_test_harness() {
+    let harness = Harness::new_ui(|ui| {
+        ui.label("Hello Notedeck");
+        let _ = ui.button("Click me");
+    });
+    harness.get_by_label("Click me");
+}
+
+#[test]
+fn smoke_test_checkbox_interaction() {
+    let mut harness = Harness::new_ui_state(
+        |ui, checked| {
+            ui.checkbox(checked, "Enable notifications");
+        },
+        false,
+    );
+
+    harness.get_by_label("Enable notifications").click();
+    harness.run();
+
+    assert!(*harness.state(), "Checkbox should be checked after click");
+}
+
+#[test]
+#[ignore] // requires lavapipe — run via scripts/snapshot-test
+fn snapshot_basic_ui() {
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(400.0, 300.0))
+        .renderer(notedeck::software_renderer())
+        .build_ui(|ui| {
+            ui.heading("Notedeck");
+            ui.separator();
+            ui.label("A nostr browser");
+            let _ = ui.button("Login");
+        });
+
+    harness.run();
+
+    harness.snapshot("basic_ui");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b/2c: Real Notedeck + Damus widget tests
+// ---------------------------------------------------------------------------
+
+/// State bundle for harness tests that need both Notedeck context and a Damus app.
+/// Separate fields enable split borrows: `app_context()` borrows `&mut notedeck`
+/// while `render()` borrows `&mut damus` — no conflict.
+struct TestState {
+    notedeck: Notedeck,
+    damus: Damus,
+    // hold tmpdir so it doesn't get cleaned up while tests run
+    _tmpdir: tempfile::TempDir,
+    // egui defers set_fonts — definitions aren't available until the next
+    // ctx.run(). We set up fonts on the first frame and skip rendering;
+    // subsequent frames have fonts loaded and render normally.
+    fonts_installed: bool,
+}
+
+/// Create a Notedeck + Damus pair initialized in a fresh tmpdir.
+/// Note: fonts/theme setup is NOT done here — the harness creates its own
+/// egui::Context, so setup() must be called inside the harness closure
+/// (which runs during construction). See `render_damus_frame`.
+fn make_test_state(egui_ctx: &egui::Context) -> TestState {
+    let tmpdir = tempfile::TempDir::new().unwrap();
+    let args: Vec<String> = vec![
+        "notedeck-test".into(), // argv[0]: consumed by init as program name
+        "--testrunner".into(),
+    ];
+    let mut notedeck = Notedeck::init(egui_ctx, tmpdir.path(), &args);
+    let damus = Damus::new(&mut notedeck.app_context(egui_ctx), &args);
+    TestState {
+        notedeck,
+        damus,
+        _tmpdir: tmpdir,
+        fonts_installed: false,
+    }
+}
+
+/// Render one frame of Damus inside a CentralPanel.
+///
+/// On the first call, installs notedeck fonts/theme on the harness's egui
+/// context and skips rendering — `set_fonts` is deferred in egui, so fonts
+/// aren't usable until the next `ctx.run()`. The harness's `run_ok()` loop
+/// (called during construction) will invoke this again with fonts loaded.
+fn render_damus_frame(ctx: &egui::Context, state: &mut TestState) {
+    if !state.fonts_installed {
+        state.notedeck.setup(ctx);
+        state.fonts_installed = true;
+        return;
+    }
+    let mut app_ctx = state.notedeck.app_context(ctx);
+    egui::CentralPanel::default().show(ctx, |ui| {
+        state.damus.render(&mut app_ctx, ui);
+    });
+}
+
+#[tokio::test]
+async fn test_damus_renders() {
+    let ctx = egui::Context::default();
+    let state = make_test_state(&ctx);
+
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(800.0, 600.0))
+        .build_state(render_damus_frame, state);
+
+    harness.run();
+}
+
+#[tokio::test]
+#[ignore] // requires lavapipe — run via scripts/snapshot-test
+async fn snapshot_damus_columns() {
+    let ctx = egui::Context::default();
+    let state = make_test_state(&ctx);
+
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(800.0, 600.0))
+        .renderer(notedeck::software_renderer())
+        .build_state(render_damus_frame, state);
+
+    harness.run();
+
+    harness.snapshot("damus_columns");
+}
+
+// ---------------------------------------------------------------------------
+// Viewport size regression snapshots
+// ---------------------------------------------------------------------------
+
+fn snapshot_at_size(width: f32, height: f32, name: &str) {
+    let ctx = egui::Context::default();
+    let state = make_test_state(&ctx);
+
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(width, height))
+        .renderer(notedeck::software_renderer())
+        .build_state(render_damus_frame, state);
+
+    harness.run();
+    harness.snapshot(name);
+}
+
+#[tokio::test]
+#[ignore] // requires lavapipe — run via scripts/snapshot-test
+async fn snapshot_mobile() {
+    snapshot_at_size(375.0, 667.0, "damus_mobile");
+}
+
+#[tokio::test]
+#[ignore] // requires lavapipe — run via scripts/snapshot-test
+async fn snapshot_tablet() {
+    snapshot_at_size(1024.0, 768.0, "damus_tablet");
+}
+
+#[tokio::test]
+#[ignore] // requires lavapipe — run via scripts/snapshot-test
+async fn snapshot_desktop_wide() {
+    snapshot_at_size(1400.0, 900.0, "damus_desktop_wide");
+}
+
+// ---------------------------------------------------------------------------
+// Light mode snapshot
+// ---------------------------------------------------------------------------
+
+/// Same as render_damus_frame but switches to light theme after font setup.
+fn render_damus_frame_light(ctx: &egui::Context, state: &mut TestState) {
+    if !state.fonts_installed {
+        state.notedeck.setup(ctx);
+        ctx.options_mut(|o| o.theme_preference = egui::ThemePreference::Light);
+        state.fonts_installed = true;
+        return;
+    }
+    let mut app_ctx = state.notedeck.app_context(ctx);
+    egui::CentralPanel::default().show(ctx, |ui| {
+        state.damus.render(&mut app_ctx, ui);
+    });
+}
+
+#[tokio::test]
+#[ignore] // requires lavapipe — run via scripts/snapshot-test
+async fn snapshot_light_mode() {
+    let ctx = egui::Context::default();
+    let state = make_test_state(&ctx);
+
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(800.0, 600.0))
+        .renderer(notedeck::software_renderer())
+        .build_state(render_damus_frame_light, state);
+
+    harness.run();
+    harness.snapshot("damus_light_mode");
+}
+
+// ---------------------------------------------------------------------------
+// Welcome → Login navigation regression test
+// ---------------------------------------------------------------------------
+
+/// Like render_damus_frame but also calls update() so that the Welcome
+/// route gets pushed during initialization. Disables animations for
+/// deterministic snapshots.
+fn render_damus_frame_with_update(ctx: &egui::Context, state: &mut TestState) {
+    if !state.fonts_installed {
+        state.notedeck.setup(ctx);
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        state.fonts_installed = true;
+        return;
+    }
+    let mut app_ctx = state.notedeck.app_context(ctx);
+    app_ctx.settings.get_settings_mut().animate_nav_transitions = false;
+    state.damus.update(&mut app_ctx, ctx);
+    egui::CentralPanel::default().show(ctx, |ui| {
+        state.damus.render(&mut app_ctx, ui);
+    });
+}
+
+/// Regression test: clicking "I have a Nostr key" on the welcome screen must
+/// navigate to the AddAccount (login) view and stay there — not bounce back
+/// to Welcome. Snapshot verifies the login screen is visible after the click.
+#[tokio::test]
+#[ignore] // requires lavapipe — run via scripts/snapshot-test
+async fn snapshot_welcome_login_navigation() {
+    let ctx = egui::Context::default();
+    let state = make_test_state(&ctx);
+
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(800.0, 600.0))
+        .renderer(notedeck::software_renderer())
+        .build_state(render_damus_frame_with_update, state);
+
+    // The welcome screen should be showing
+    assert!(
+        harness.query_by_label("I have a Nostr key").is_some(),
+        "Welcome screen should be visible before click"
+    );
+
+    // Click "I have a Nostr key"
+    harness.get_by_label("I have a Nostr key").click();
+    harness.run();
+
+    // After clicking, we should be on the login screen, not back on Welcome
+    assert!(
+        harness.query_by_label("I have a Nostr key").is_none(),
+        "Welcome screen should no longer be visible after clicking login"
+    );
+
+    // Snapshot should show the login/AddAccount screen, not the Welcome screen
+    harness.snapshot("welcome_login_navigation");
+}
+
+// ---------------------------------------------------------------------------
+// Auto-update sidebar snapshot
+// ---------------------------------------------------------------------------
+
+/// State for tick()-based tests — Chrome is set on Notedeck via set_app,
+/// so tick() handles all rendering through the real code path.
+#[cfg(all(feature = "auto-update", feature = "snapshot-testing"))]
+struct TickTestState {
+    notedeck: Notedeck,
+    _tmpdir: tempfile::TempDir,
+    fonts_installed: bool,
+}
+
+/// Render via Notedeck::tick(), which runs the full app loop
+/// including the Chrome sidebar with update item.
+#[cfg(all(feature = "auto-update", feature = "snapshot-testing"))]
+fn render_notedeck_tick(ctx: &egui::Context, state: &mut TickTestState) {
+    if !state.fonts_installed {
+        state.notedeck.setup(ctx);
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        state.fonts_installed = true;
+        return;
+    }
+    state.notedeck.tick(ctx);
+}
+
+#[cfg(all(feature = "auto-update", feature = "snapshot-testing"))]
+#[tokio::test]
+#[ignore] // requires lavapipe — run via scripts/snapshot-test
+async fn snapshot_update_bar() {
+    use notedeck::updater::nostr::test_helpers;
+    use notedeck_chrome::Chrome;
+
+    let ctx = egui::Context::default();
+    let tmpdir = tempfile::TempDir::new().unwrap();
+    let args: Vec<String> = vec!["notedeck-test".into(), "--testrunner".into()];
+    let mut notedeck = Notedeck::init(&ctx, tmpdir.path(), &args);
+
+    // Create Chrome with updater, pointing at our test signing key
+    let mut chrome = {
+        let mut app_ctx = notedeck.app_context(&ctx);
+        Chrome::new_test(&mut app_ctx, &ctx, &args)
+    };
+
+    {
+        let app_ctx = &mut notedeck.app_context(&ctx);
+        chrome.set_release_pubkey(app_ctx.ndb, test_helpers::TEST_PUBKEY);
+    }
+
+    // Ingest properly signed NIP-82 events (kind 3063 asset + kind 30063 release)
+    let (asset_ev, asset_id) = test_helpers::build_signed_asset_event(
+        &test_helpers::TEST_SECRET_KEY,
+        "99.0.0",
+        notedeck::updater::nostr::target_platform_tag(),
+        "https://example.com/download/notedeck.tar.gz",
+        "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+    );
+    let release_ev = test_helpers::build_signed_release_event(
+        &test_helpers::TEST_SECRET_KEY,
+        "99.0.0",
+        "main",
+        &[asset_id],
+    );
+    {
+        let app_ctx = notedeck.app_context(&ctx);
+        app_ctx
+            .ndb
+            .process_event_with(&asset_ev, nostrdb::IngestMetadata::new())
+            .unwrap();
+        app_ctx
+            .ndb
+            .process_event_with(&release_ev, nostrdb::IngestMetadata::new())
+            .unwrap();
+    }
+
+    // Force updater into ReadyToInstall (the event was ingested and would
+    // be discovered by tick(), but the download would fail in tests since
+    // the URL is fake — so we skip straight to ReadyToInstall)
+    chrome.force_update_ready("99.0.0".to_string());
+
+    // Open the drawer so the update item is visible in the snapshot
+    chrome.toggle();
+
+    notedeck.set_app(chrome);
+
+    let state = TickTestState {
+        notedeck,
+        _tmpdir: tmpdir,
+        fonts_installed: false,
+    };
+
+    let mut harness = Harness::builder()
+        .with_size(egui::Vec2::new(800.0, 600.0))
+        .renderer(notedeck::software_renderer())
+        .build_state(render_notedeck_tick, state);
+
+    harness.snapshot("update_bar");
+}

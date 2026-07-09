@@ -36,10 +36,10 @@ pub async fn android_main(android_app: AndroidApp) {
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap();
 
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt_layer)
-        .init();
+        .try_init();
 
     let _ = android_keyring::set_android_keyring_credential_builder();
 
@@ -66,7 +66,7 @@ pub async fn android_main(android_app: AndroidApp) {
         Box::new(move |cc| {
             let ctx = &cc.egui_ctx;
 
-            let mut notedeck = Notedeck::new(ctx, path, &app_args);
+            let mut notedeck = Notedeck::init(ctx, path, &app_args);
             notedeck.set_android_context(android_app);
             notedeck.setup(ctx);
             let chrome = Chrome::new_with_apps(cc, &app_args, &mut notedeck)?;
